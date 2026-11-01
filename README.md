@@ -6,7 +6,8 @@ LogKV に置換し、蒸留・追加学習による適応を検証するプロ�
 元Llamaの全32層でQ/K/V/O、RoPE、FFN、RMSNormを流用し、Attentionのみ
 LogKVに変更する独立推論APIとCLIを実装しています。蒸留・追加学習は行っていません。
 TransformersのCache/model.generateへの組み込みは未対応で、独自のgreedy生成を使用します。
-品質・速度の維持は保証しません。
+初期評価では元モデルが4問とも正答した一方、未蒸留LogKVの両条件は反復出力となりました。
+[実重みでの初期品質・性能結果](doc/initial-quality-20261102.md)を参照してください。
 
 ## 環境
 
@@ -141,6 +142,7 @@ GQA・生成キャッシュ・LoRA の勾配を CPU で確認します。8B モ�
 - `src/llm_jp_logkv/cli.py`: 保存先作成・環境確認・モデル取得
 - `tests/logkv/`: 移植元由来の回帰テスト
 - `src/llm_jp_logkv/llama_attention.py`: 投影流用・RoPE後のdense/LogKV独立API
+- [実重みの初期評価（蒸留なし）](doc/initial-quality-20261102.md)
 - [アダプター仕様と検証](doc/llama-adapter-20261101.md)
 - [引き継ぎと実装計画](doc/handoff-20261101.md)
 - [初期環境の検証結果（174 tests passed）](doc/setup-validation-20261101.md)

@@ -5,8 +5,10 @@
 - Read `README.md`, `doc/handoff-20261101.md`, and `UPSTREAM.json` before architectural work.
 - `/home/myxy/RecursiveCompressor` is the upstream reference. Changes there require
   a task that includes that repository; runtime must not depend on its working tree.
-- Current status is scaffolding plus a copied LogKV core. Do not imply that Llama
-  conversion, distillation, or preservation of reasoning quality is already implemented.
+- Current status includes standalone full-model Llama/LogKV inference and an initial
+  pretrained quality comparison; see `doc/initial-quality-20261102.md`. Distillation
+  is not implemented or performed. The untrained conversion failed the initial
+  smoke prompts; do not claim preserved reasoning quality or a usable adapted model.
 
 # Environment and artifacts
 
