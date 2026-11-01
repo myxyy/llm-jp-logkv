@@ -105,6 +105,7 @@ def generate(model, tokenizer, ids, args, mode):
     seconds = time.perf_counter() - started
     return {
         'input_tokens': ids.shape[1], 'output_tokens': tokens.shape[1],
+        'input_token_ids': ids[0].tolist(),
         'token_ids': tokens[0].tolist(), 'text': tokenizer.decode(tokens[0], skip_special_tokens=False),
         'text_without_special_tokens': tokenizer.decode(tokens[0], skip_special_tokens=True),
         'stop_reason': reason, 'seconds_including_prefill': seconds,
