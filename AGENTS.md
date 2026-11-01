@@ -5,10 +5,11 @@
 - Read `README.md`, `doc/handoff-20261101.md`, and `UPSTREAM.json` before architectural work.
 - `/home/myxy/RecursiveCompressor` is the upstream reference. Changes there require
   a task that includes that repository; runtime must not depend on its working tree.
-- Current status includes standalone full-model Llama/LogKV inference and an initial
-  pretrained quality comparison; see `doc/initial-quality-20261102.md`. Distillation
-  is not implemented or performed. The untrained conversion failed the initial
-  smoke prompts; do not claim preserved reasoning quality or a usable adapted model.
+- Current status includes standalone full-model Llama/LogKV inference, an initial
+  pretrained comparison, and fixed-decay LoRA distillation with DDP and checkpoints.
+  See `doc/initial-quality-20261102.md` and `doc/distillation-20261102.md`.
+  The untrained conversion failed the initial smoke prompts. Distillation quality
+  must be established from actual evaluation; do not assume preserved reasoning.
 
 # Environment and artifacts
 
@@ -40,3 +41,5 @@
 - CPU setup checks do not authorize a large training campaign. Carry forward the user's
   machine constraint: at most two GPUs for continuous experiments; ask before a proposed
   experiment expected to take eight hours or longer. Later explicit user instructions prevail.
+- For the 2026-11-02 fixed-decay distillation trial, the user explicitly authorized
+  eight hours and all six GPUs. This exception applies to that trial only.
