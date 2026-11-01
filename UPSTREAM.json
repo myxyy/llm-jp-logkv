@@ -1,0 +1,37 @@
+{
+  "project": "RecursiveCompressor",
+  "local_source": "/home/myxy/RecursiveCompressor",
+  "commit": "02abb4f803ca85db5a01a17acc3394e8b44f8bb2",
+  "imported_on": "2026-11-01",
+  "license": "MIT",
+  "files": [
+    {
+      "source": "models/logkv/attention.py",
+      "destination": "src/llm_jp_logkv/logkv/attention.py",
+      "source_sha256": "01feb5c8fcab9433883d438c927011df01cb67e5c557a9384671b6b5101f28b7",
+      "destination_sha256": "01feb5c8fcab9433883d438c927011df01cb67e5c557a9384671b6b5101f28b7",
+      "adaptation": "none"
+    },
+    {
+      "source": "tests/logkv/test_logkv.py",
+      "destination": "tests/logkv/test_logkv.py",
+      "source_sha256": "780cbfd669303691a25661e23655f872e78bb65fdc4600a31cf0e06585302ff2",
+      "destination_sha256": "fad4ae073e755b553194c2ae73d7f68e8050db697b3064bf8e25f20ad348108f",
+      "adaptation": "import path only"
+    },
+    {
+      "source": "tests/logkv/test_logkv_grouped_forward.py",
+      "destination": "tests/logkv/test_logkv_grouped_forward.py",
+      "source_sha256": "8278340aefc909bc87d1e5debb6a9aba230226170ede3f8766b99332bc043619",
+      "destination_sha256": "887ba9c98bb8487f53c42c703877add9ac58057e020fbc1e0e244bd023710bdb",
+      "adaptation": "import path only"
+    },
+    {
+      "source": "LICENSE",
+      "destination": "LICENSE",
+      "source_sha256": "a02e1cf7042a50aa90a1a2b2158e6bdcac01ae864cadc192c5ee0d689e17b35b",
+      "destination_sha256": "a02e1cf7042a50aa90a1a2b2158e6bdcac01ae864cadc192c5ee0d689e17b35b",
+      "adaptation": "none"
+    }
+  ]
+}

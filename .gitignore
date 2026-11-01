@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local configuration; keep only the shareable template.
+.env
+.env.*
+!.env.example
+
+# Model/data artifacts belong on the RAID volume.
+data/
+models/
+checkpoints/
+experiments/
+logs/
+.cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.parquet
+*.arrow
+*.mmap
+events.out.tfevents.*
+
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

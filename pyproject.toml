@@ -1,0 +1,38 @@
+[project]
+name = "llm-jp-logkv"
+version = "0.1.0"
+description = "Distilling Llama attention into hierarchical LogKV attention"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "accelerate>=1.10,<2",
+    "datasets>=4.8.4,<5",
+    "huggingface-hub>=1.8,<2",
+    "peft>=0.18,<1",
+    "python-dotenv>=1.2,<2",
+    "safetensors>=0.7,<1",
+    "sentencepiece>=0.2.1,<0.3",
+    "torch==2.11.0",
+    "transformers==5.4.0",
+]
+
+[project.scripts]
+llm-jp-logkv = "llm_jp_logkv.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9,<10"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["uv_build>=0.10.9,<0.11.0"]
+build-backend = "uv_build"
