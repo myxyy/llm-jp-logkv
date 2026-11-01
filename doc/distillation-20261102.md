@@ -128,4 +128,26 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
   `/mnt/raid0/llm-jp-logkv/logs/distill-loss-chunk-benchmark-20261102.json`。
   同測定のlossは設定間で更新を継続したため、品質比較には使用しない。
 
-8時間試行の実行先と結果は確認後に追記する。
+## 8時間試行の実行記録（進行中）
+
+- Run: `distill-fixed-20261101T162321Z-5dfd0965`
+- Source: `ee47991e1b3ed6d194bd704e44a3dde1be5dbbd2`、開始時clean。
+- 訓練開始: **2026-11-02 01:23:50 JST**。
+- 訓練deadline: **2026-11-02 09:23:50 JST**、続けて最終保存・検証・生成比較。
+- 6 GPU稼働とteacher固定・LoRA 27,262,976 parametersをruntimeで確認。
+- 初期の固定48会話: KL=4.2372867、CE=5.3847451、26,443 tokens。
+  全674会話の開始・終了時比較は `validation.jsonl` の `*_all_heldout` を使用する。
+
+| 内容 | 保存先 |
+|---|---|
+| manifest、step metrics、validation、生成全文 | `/mnt/raid0/llm-jp-logkv/experiments/distill-fixed-20261101T162321Z-5dfd0965/` |
+| torchrunログ、PID、終了コード | `/mnt/raid0/llm-jp-logkv/logs/distill-fixed-20261101T162321Z-5dfd0965/` |
+| checkpoint | `/mnt/raid0/llm-jp-logkv/checkpoints/distill-fixed-20261101T162321Z-5dfd0965/` |
+
+`samples/initial-step-0000000.json`、`samples/periodic-step-NNNNNNN.json`、
+`samples/final-step-NNNNNNN.json` に6問を保存する。訓練終了後はrunの
+`completed.json` とログの `training-exit.json`、`evaluation-exit.json`、
+`supervisor-completed.json` を確認する。最終比較の新規artifact directoryは
+`final-evaluation.log` に出力される。起動済みrunを重複起動しない。
+
+最終結果は訓練・評価の終了を確認してから追記する。
