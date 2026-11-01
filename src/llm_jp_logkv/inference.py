@@ -116,10 +116,11 @@ def generate(model, tokenizer, ids, args, mode):
 
 @torch.inference_mode()
 def text_nll(model, ids, mode, chunk_size):
-    """Token-weighted next-token NLL of plain text, BOS included, no chat.
+    """Token-weighted next-token NLL of plain text, no chat.
 
     Full-vocabulary logits are converted to FP32 only for a bounded segment.
-    All tokens after BOS are scored; no overlap or boundary token is omitted.
+    All tokens after the first input token are scored. BOS insertion follows
+    the original tokenizer; chunk boundaries do not omit additional tokens.
     """
     total, count, state = 0., 0, None
     for start in range(0, ids.shape[1] - 1, chunk_size):
@@ -197,6 +198,8 @@ def run_evaluation(settings, args):
                 # Preserve original BOS behavior and never downcast token IDs.
                 ids = tokenizer(item['text'], add_special_tokens=True, return_tensors='pt').input_ids.to(args.device)
                 result = {'kind': 'nll', 'mode': mode, **item,
+                          'input_token_ids': ids[0].tolist(),
+                          'bos_token_present': ids[0, 0].item() == tokenizer.bos_token_id,
                           **text_nll(model, ids, mode, args.prefill_chunk_size)}
                 stream.write(json.dumps(result, ensure_ascii=False) + '\n')
                 stream.flush()
