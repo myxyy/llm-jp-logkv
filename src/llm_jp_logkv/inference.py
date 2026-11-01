@@ -69,7 +69,7 @@ def prompt_ids(tokenizer, prompt, args, *, date):
     return tokenizer.apply_chat_template(
         [{'role': 'user', 'content': prompt}], tokenize=True, add_generation_prompt=True,
         reasoning_effort=args.reasoning_effort, conversation_start_date=date,
-        return_tensors='pt').to(args.device)
+        return_tensors='pt', return_dict=True).input_ids.to(args.device)
 
 
 def sync(device):

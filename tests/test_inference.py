@@ -27,3 +27,18 @@ def test_chunked_nll_matches_full_sequence(mode):
     result = text_nll(model, ids, mode, chunk_size=3)
     assert result['tokens'] == ids.shape[1] - 1
     assert result['nll_sum'] == pytest.approx(expected, abs=1e-5)
+
+
+def test_prompt_ids_extracts_tensor_from_transformers_chat_encoding():
+    from argparse import Namespace
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+    from llm_jp_logkv.inference import prompt_ids
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({'[UNK]': 0, 'hello': 1}, unk_token='[UNK]')),
+        unk_token='[UNK]')
+    tokenizer.chat_template = '{{ messages[0].content }}'
+    ids = prompt_ids(tokenizer, 'hello', Namespace(device='cpu', reasoning_effort='low'), date='2026-11-01')
+    assert isinstance(ids, torch.Tensor)
+    assert ids.tolist() == [[1]]
