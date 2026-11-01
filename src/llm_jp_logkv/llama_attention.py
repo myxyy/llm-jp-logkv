@@ -42,9 +42,10 @@ class LlamaAttentionAdapter(nn.Module):
         # projected-tensor entry point, so remove their parameters here only.
         self.core = None
         if mode == "logkv":
-            self.core = LogKV(self.heads * self.head_dim, chunk_size,
-                              num_heads=self.heads, self_slot=True,
-                              no_level_bias=no_level_bias)
+            with torch.device("meta"):
+                self.core = LogKV(self.heads * self.head_dim, chunk_size,
+                                  num_heads=self.heads, self_slot=True,
+                                  no_level_bias=no_level_bias)
             for name in ("lq", "lk", "lv", "lo"):
                 setattr(self.core, name, nn.Identity())
 

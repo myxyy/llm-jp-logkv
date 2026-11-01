@@ -3,9 +3,10 @@
 `llm-jp/llm-jp-4.1-8b-thinking` の学習済み Llama を出発点に、Attention を
 LogKV に置換し、蒸留・追加学習による適応を検証するプロジェクトです。
 
-現在は環境と参照実装の準備段階です。LogKV コア、元の回帰テスト、
-保存先設定、モデル取得コマンドを用意しています。GQA/RoPE を扱う独立APIの最小 Attention アダプターを追加しました。
-Transformers の生成APIへの組み込み、モデル全体の置換、蒸留トレーナーは未実装です。
+元Llamaの全32層でQ/K/V/O、RoPE、FFN、RMSNormを流用し、Attentionのみ
+LogKVに変更する独立推論APIとCLIを実装しています。蒸留・追加学習は行っていません。
+TransformersのCache/model.generateへの組み込みは未対応で、独自のgreedy生成を使用します。
+品質・速度の維持は保証しません。
 
 ## 環境
 
@@ -83,13 +84,43 @@ VS Code の Python interpreter は `.venv/bin/python` を指定できます。
 
 保存先は `${MODEL_DIR}/llm-jp--llm-jp-4.1-8b-thinking/${BASE_MODEL_REVISION}/`。
 HF の download metadata もこの保存先内に作られます。取得モードと revision は
-同じディレクトリの `download_manifest.json` に記録します。
+同じディレクトリの日時・ID付き `download_manifest-*.json` に追記します。
+初期取得時の `download_manifest.json` も保持します。
 このコマンドは重みをロードしたり学習を開始したりしません。
 
 llm-jp の tokenizer / chat template を維持します。元プロジェクトの
 `[INST]...[/INST]` 形式やトークン化済みデータは、そのまま流用できません。
 特に語彙数は 196,608 のため、元プロジェクトの uint16 トークン保存形式は使えません。
 新しいトークンキャッシュを実装する際は uint32 等を使用してください。
+
+## 蒸留なしの初期推論
+
+```bash
+# 固定revisionの全重みが必要（初回のみ）
+./scripts/uv.sh run --locked llm-jp-logkv download-model --weights
+
+# 1 GPU、全32層LogKV、C=4、固定レベル減衰、BF16
+CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
+  --prompt '日本の首都はどこですか。短く答えてください。' --max-new-tokens 512
+
+# 元モデル / LogKV固定減衰 / LogKV減衰なしの小規模比較
+CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv evaluate-initial
+```
+
+`infer --mode original` は元モデルのHF生成、`--no-level-bias` はLogKVの減衰なし。
+元tokenizerとHarmony chat templateを使い、reasoning_effort=low、greedy、EOS=[2,13]。
+`--reasoning-effort`、`--max-new-tokens`、`--prefill-chunk-size` を変更可能です。
+元templateを通じてanalysis/finalのチャネルを生成し、生の特殊トークン付き出力も保存します。
+初期生成でanalysisのみのまま上限に達した場合、最終回答が完了したとは扱いません。
+
+重みをローカルからロードし、全層を単一deviceへ配置します。paddingなし・1プロンプト、
+連続した位置での推論に対応します。量子化・学習・FFN/RMSNormの変更はありません。
+圧縮状態は32 Qヘッドで保持し、8 KVヘッド共有とは異なります。
+
+出力は `${EXPERIMENT_DIR}/inference-*` または `initial-quality-*` の新規ディレクトリへ保存。
+manifestにソースcommit、model revision、依存関係、設定、入力suiteを記録します。
+固定文章のNLL/PPLと生成例は小さな手書きsmoke検証で、標準ベンチマークではありません。
+性能値は生成全体の時間と割当ピークの参考値です。速度比較に特化した測定ではありません。
 
 ## 検証
 

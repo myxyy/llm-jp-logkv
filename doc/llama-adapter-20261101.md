@@ -57,3 +57,20 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES='' ./scripts/uv.sh run 
 Transformersのモデル全体でdenseモードの等価性を確認するための接続層と
 Cacheインターフェースを設計する。padding/位置/生成時のstate管理を明確にし、
 その後少数層置換・実重み取得・蒸留の時間と必要ストレージを見積もる。
+
+## 全層推論APIへの拡張
+
+`LlamaLogKVForCausalLM` は元モデルのembedding/rotary/norm/FFN/LM headを
+Moduleの同一性を保って流用する。残差・RMSNorm・FFNの順序はpinned Llamaと同じ。
+全層で独立アダプターを呼び、ModelStateに各層のAttentionStateを返す。
+元モデルを変更せず、パラメータを共有する。学習・量子化は行わない。
+LogKV core生成時の使わない投影はmeta上で構築し、Identityへ置換する。
+コアのソースファイル・計算意味は変えない。
+
+独自greedy_generateはprefillを分割でき、EOS=[2,13]で終了する。
+返す状態は最後に生成したトークンも消費済み。HF Cache/model.generate接続ではない。
+同一device、paddingなしの連続系列専用。複数リクエストは別stateで処理する。
+
+CPU検証に全モデルdense logits/greedy生成の元Llama一致（FP32/BF16）、
+全層LogKVの分割一致（FP64）、因果性、state非破壊、重み同一性、EOS停止、
+評価NLLのチャンク境界を含む全トークン計数を追加した。

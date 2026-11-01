@@ -1,0 +1,16 @@
+{
+  "description": "Handwritten smoke probes, not a standardized benchmark. No training data or distillation.",
+  "conversation_start_date": "2026-11-01",
+  "reasoning_effort": "low",
+  "prompts": [
+    {"id": "capital", "category": "Japanese factual QA", "prompt": "日本の首都はどこですか。短く答えてください。", "expected": "東京"},
+    {"id": "arithmetic", "category": "arithmetic", "prompt": "りんごが17個あります。8個を友達に渡し、その後5個買いました。今、りんごは何個ありますか。", "expected": "14"},
+    {"id": "summary", "category": "Japanese instruction following", "prompt": "次の文章を一文で要約してください。『市立図書館は来月から日曜日も開館する。平日の開館時間は変わらない。日曜日の利用時間は午前10時から午後4時までである。』", "expected": "日曜開館、10時から16時、平日は変更なし"},
+    {"id": "retrieval", "category": "short context retrieval", "prompt": "次のメモだけを根拠に答えてください。\n赤チームの合言葉は『さくら』です。\n青チームの合言葉は『こはく』です。\n緑チームの合言葉は『すみれ』です。\n白チームの合言葉は『つばめ』です。\n質問：青チームの合言葉は何ですか。", "expected": "こはく"}
+  ],
+  "texts": [
+    {"id": "japanese", "text": "日本の図書館では、さまざまな本を借りることができます。利用者は読みたい本を選び、受付で貸し出しの手続きをします。読み終わった本は決められた日までに返します。図書館には新聞や雑誌も置かれており、静かな場所で調べ物をすることができます。分からないことがあれば、図書館の職員に相談できます。"},
+    {"id": "reasoning", "text": "箱の中には赤い玉が三つと青い玉が二つあります。玉は全部で五つです。この箱から青い玉を一つ取り出すと、赤い玉が三つと青い玉が一つ残ります。残った玉の数は四つです。さらに赤い玉を一つ追加すると、赤い玉は四つになり、全体の数は再び五つになります。"},
+    {"id": "english", "text": "A small library opened near the station. It has books for children and adults. Visitors can read at a desk or borrow a book to take home. The library is closed on Monday. On other days it opens at nine in the morning and closes at six in the evening. A sign at the entrance explains how to register for a library card."}
+  ]
+}
