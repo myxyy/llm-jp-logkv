@@ -4,8 +4,8 @@
 LogKV に置換し、蒸留・追加学習による適応を検証するプロジェクトです。
 
 現在は環境と参照実装の準備段階です。LogKV コア、元の回帰テスト、
-保存先設定、モデル取得コマンドを用意しています。Llama の Attention 置換、
-GQA/RoPE を扱うアダプター、蒸留トレーナーは今後実装します。
+保存先設定、モデル取得コマンドを用意しています。GQA/RoPE を扱う独立APIの最小 Attention アダプターを追加しました。
+Transformers の生成APIへの組み込み、モデル全体の置換、蒸留トレーナーは未実装です。
 
 ## 環境
 
@@ -109,6 +109,8 @@ GQA・生成キャッシュ・LoRA の勾配を CPU で確認します。8B モ�
 - `src/llm_jp_logkv/settings.py`: `.env` と保存先
 - `src/llm_jp_logkv/cli.py`: 保存先作成・環境確認・モデル取得
 - `tests/logkv/`: 移植元由来の回帰テスト
+- `src/llm_jp_logkv/llama_attention.py`: 投影流用・RoPE後のdense/LogKV独立API
+- [アダプター仕様と検証](doc/llama-adapter-20261101.md)
 - [引き継ぎと実装計画](doc/handoff-20261101.md)
 - [初期環境の検証結果（174 tests passed）](doc/setup-validation-20261101.md)
 
