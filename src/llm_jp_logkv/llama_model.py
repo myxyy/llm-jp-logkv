@@ -105,6 +105,8 @@ class LlamaLogKVForCausalLM(nn.Module):
             logits, state = self(part, state, logits_to_keep=1)
         generated, reason = [], 'length'
         for _ in range(max_new_tokens):
+            if not torch.isfinite(logits).all().item():
+                raise FloatingPointError('Non-finite generation logits')
             token = logits[:, -1].argmax(-1, keepdim=True)
             generated.append(token)
             # Consume final token as well so the returned state is resumable.

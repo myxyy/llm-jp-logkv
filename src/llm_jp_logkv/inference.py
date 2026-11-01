@@ -134,6 +134,8 @@ def text_nll(model, ids, mode, chunk_size):
         target = ids[:, start + 1:end + 1]
         loss = torch.nn.functional.cross_entropy(
             logits.float().reshape(-1, logits.shape[-1]), target.reshape(-1), reduction='sum')
+        if not torch.isfinite(loss).item():
+            raise FloatingPointError('Non-finite evaluation loss')
         total += loss.item()
         count += target.numel()
     return {'nll_sum': total, 'tokens': count, 'mean_nll': total / count}
