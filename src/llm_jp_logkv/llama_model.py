@@ -32,7 +32,8 @@ class LlamaLogKVForCausalLM(nn.Module):
 
     All layers use the selected mode. The source model is not modified and
     weights are shared, so source and wrapper must not be trained independently.
-    No distillation, quantization, or new learned parameters are involved.
+    Construction adds no learned parameters or quantization. Distillation can
+    subsequently wrap the student's attention projections with separate LoRA.
     """
 
     def __init__(self, source, *, mode='logkv', chunk_size=4, no_level_bias=False):

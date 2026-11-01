@@ -56,10 +56,7 @@ class LlamaAttentionAdapter(nn.Module):
             raise ValueError("State mode does not match adapter")
         batch, length, _ = hidden_states.shape
         offset = 0 if state is None else state.offset
-        shape = (batch, length, -1, self.head_dim)
-        q, k, v = [proj(hidden_states).view(shape).transpose(1, 2)
-                   for proj in (self.q_proj, self.k_proj, self.v_proj)]
-        q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
+        q, k, v = self._project(hidden_states, position_embeddings)
         if self.mode == "dense":
             if state is not None:
                 old_k, old_v = state.payload
@@ -81,3 +78,40 @@ class LlamaAttentionAdapter(nn.Module):
             out = out.view(batch, self.heads, length, self.head_dim)
         out = out.transpose(1, 2).reshape(batch, length, self.heads * self.head_dim)
         return self.o_proj(out), AttentionState(self.mode, offset + length, payload)
+
+
+    def _project(self, hidden_states, position_embeddings):
+        batch, length, _ = hidden_states.shape
+        shape = (batch, length, -1, self.head_dim)
+        q, k, v = [proj(hidden_states).view(shape).transpose(1, 2)
+                   for proj in (self.q_proj, self.k_proj, self.v_proj)]
+        q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
+        return q, k, v
+
+    def forward_full(self, hidden_states, position_embeddings):
+        """Grouped full-sequence training path; no inference state is retained.
+
+        Uses the unchanged reference hierarchy and grouped QK/PV implementation.
+        Numerically equivalent to forward(..., state=None), modulo dtype rounding.
+        """
+        if self.mode != 'logkv':
+            return self(hidden_states, position_embeddings)[0]
+        batch, length, _ = hidden_states.shape
+        q, k, v = self._project(hidden_states, position_embeddings)
+        k, v = repeat_kv(k, self.groups), repeat_kv(v, self.groups)
+        q, k, v = [t.reshape(batch * self.heads, length, self.head_dim) for t in (q, k, v)]
+        contexts = []
+        nq, nk, nv = q, k, v
+        C = self.core.chunk_size
+        while nq.shape[1] > 0:
+            contexts.append((0, nk, nv))
+            chunks = nq.shape[1] // C
+            if not chunks:
+                break
+            shape = (q.shape[0] * chunks, C, self.head_dim)
+            nq, nk, nv = self.core.compressor(*[
+                t[:, :chunks * C].reshape(shape) for t in (nq, nk, nv)])
+            nq, nk, nv = [t.reshape(q.shape[0], chunks, self.head_dim) for t in (nq, nk, nv)]
+        out = self.core._attend_full_contexts(q, k, v, contexts)
+        out = out.view(batch, self.heads, length, self.head_dim)
+        return self.o_proj(out.transpose(1, 2).reshape(batch, length, -1))

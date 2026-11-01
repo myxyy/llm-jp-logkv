@@ -1,4 +1,4 @@
-"""Local pretrained inference and small, recorded no-distillation comparisons."""
+"""Local inference and recorded comparisons, optionally loading distilled LoRA."""
 from datetime import datetime, timezone
 from hashlib import sha256
 from importlib.metadata import version
@@ -47,7 +47,10 @@ def provenance(settings, args):
             {'sha256': file_hash(p)} if p.suffix != '.safetensors' else {})}
             for p in sorted(settings.model_path.iterdir()) if p.is_file()},
         'arguments': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-        'training': False, 'distillation': False,
+        'training': False, 'distillation': False,  # This execution only evaluates.
+        'uses_distilled_adapter': bool(getattr(args, 'adapter', None)),
+        'adapter_checkpoint': str(args.adapter) if getattr(args, 'adapter', None) else None,
+        'adapter_sha256': file_hash(args.adapter / 'adapter.pt') if getattr(args, 'adapter', None) else None,
         'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
         'device': args.device, 'dtype': 'bfloat16',
         'gpu': torch.cuda.get_device_name(args.device) if args.device.startswith('cuda') else None,
@@ -157,14 +160,22 @@ def dense_check(source, ids):
     return result
 
 
+def student_for_run(source, settings, args, *, no_level_bias=False):
+    if getattr(args, 'adapter', None):
+        from .distillation import student_from_checkpoint
+        return student_from_checkpoint(source, args.adapter, model_id=settings.model_id,
+                                       model_revision=settings.model_revision, chunk_size=args.chunk_size)
+    return LlamaLogKVForCausalLM(source, chunk_size=args.chunk_size, no_level_bias=no_level_bias)
+
+
 def run_infer(settings, args):
     run = new_run(settings, 'inference')
     print(f'Artifact directory: {run}', flush=True)
     manifest = provenance(settings, args)
     write_json(run / 'manifest.json', manifest)
     tokenizer, source = load_model(settings, args.device)
-    model = source if args.mode == 'original' else LlamaLogKVForCausalLM(
-        source, mode='logkv', chunk_size=args.chunk_size, no_level_bias=args.no_level_bias)
+    model = source if args.mode == 'original' else student_for_run(
+        source, settings, args, no_level_bias=args.no_level_bias)
     ids = prompt_ids(tokenizer, args.prompt, args, date=args.conversation_start_date)
     result = generate(model, tokenizer, ids, args, args.mode)
     write_json(run / 'result.json', {'prompt': args.prompt, 'mode': args.mode, **result})
@@ -178,16 +189,17 @@ def run_evaluation(settings, args):
     manifest = provenance(settings, args)
     manifest['suite_sha256'] = file_hash(args.suite)
     manifest['suite'] = suite
-    manifest['limitations'] = 'Handwritten smoke set; not a benchmark or long-context evaluation. No training.'
+    manifest['limitations'] = 'Handwritten smoke set; not a benchmark or long-context evaluation. No training during evaluation.'
     write_json(run / 'manifest.json', manifest)
     tokenizer, source = load_model(settings, args.device)
     ids = prompt_ids(tokenizer, suite['prompts'][0]['prompt'], args, date=args.conversation_start_date)
     write_json(run / 'dense-equivalence.json', dense_check(source, ids))
     results = []
+    modes = ('original', 'logkv') if getattr(args, 'adapter', None) else ('original', 'logkv', 'logkv_no_bias')
     with (run / 'results.jsonl').open('x', encoding='utf-8') as stream:
-        for mode in ('original', 'logkv', 'logkv_no_bias'):
-            model = source if mode == 'original' else LlamaLogKVForCausalLM(
-                source, chunk_size=args.chunk_size, no_level_bias=mode == 'logkv_no_bias')
+        for mode in modes:
+            model = source if mode == 'original' else student_for_run(
+                source, settings, args, no_level_bias=mode == 'logkv_no_bias')
             for item in suite['prompts']:
                 ids = prompt_ids(tokenizer, item['prompt'], args, date=args.conversation_start_date)
                 result = {'kind': 'generation', 'mode': mode, **item,
@@ -211,7 +223,7 @@ def run_evaluation(settings, args):
             if mode != 'original':
                 del model
     summary = {}
-    for mode in ('original', 'logkv', 'logkv_no_bias'):
+    for mode in modes:
         nlls = [r for r in results if r['mode'] == mode and r['kind'] == 'nll']
         mean = sum(r['nll_sum'] for r in nlls) / sum(r['tokens'] for r in nlls)
         summary[mode] = {'mean_nll': mean, 'perplexity': math.exp(mean),

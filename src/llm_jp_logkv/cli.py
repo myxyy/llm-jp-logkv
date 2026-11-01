@@ -1,4 +1,4 @@
-"""Storage, pinned model download, and no-distillation LogKV inference."""
+"""Storage, pinned model download, and optional distilled-adapter inference."""
 
 import argparse
 from datetime import datetime, timezone
@@ -76,6 +76,7 @@ def main() -> None:
                             ("evaluate-initial", "Compare original and untrained LogKV")):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--device", default="cuda:0")
+        command.add_argument("--adapter", type=Path, help="Distilled LoRA checkpoint directory")
         command.add_argument("--chunk-size", type=int, default=4)
         command.add_argument("--prefill-chunk-size", type=int, default=128)
         command.add_argument("--max-new-tokens", type=int, default=512)
@@ -89,6 +90,8 @@ def main() -> None:
             command.add_argument("--suite", type=Path, default=Path("evaluation/initial-quality.json"))
     args = parser.parse_args()
     if args.command in ("infer", "evaluate-initial"):
+        if args.adapter and (getattr(args,"mode",None)=="original" or getattr(args,"no_level_bias",False)):
+            parser.error("Adapters require fixed-decay LogKV mode")
         if args.chunk_size < 2 or args.prefill_chunk_size < 1 or args.max_new_tokens < 1:
             parser.error("chunk-size >= 2 and positive token limits are required")
     try:
