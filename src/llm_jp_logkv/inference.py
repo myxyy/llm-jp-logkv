@@ -2,6 +2,8 @@
 from datetime import datetime, timezone
 from hashlib import sha256
 from importlib.metadata import version
+import math
+import os
 import json
 from pathlib import Path
 import subprocess
@@ -46,7 +48,7 @@ def provenance(settings, args):
             for p in sorted(settings.model_path.iterdir()) if p.is_file()},
         'arguments': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         'training': False, 'distillation': False,
-        'cuda_visible_devices': __import__('os').environ.get('CUDA_VISIBLE_DEVICES'),
+        'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
         'device': args.device, 'dtype': 'bfloat16',
         'gpu': torch.cuda.get_device_name(args.device) if args.device.startswith('cuda') else None,
         'attention': {'all_layers': True, 'chunk_size': args.chunk_size,
@@ -153,6 +155,7 @@ def dense_check(source, ids):
 
 def run_infer(settings, args):
     run = new_run(settings, 'inference')
+    print(f'Artifact directory: {run}', flush=True)
     manifest = provenance(settings, args)
     write_json(run / 'manifest.json', manifest)
     tokenizer, source = load_model(settings, args.device)
@@ -166,6 +169,7 @@ def run_infer(settings, args):
 
 def run_evaluation(settings, args):
     run = new_run(settings, 'initial-quality')
+    print(f'Artifact directory: {run}', flush=True)
     suite = json.loads(args.suite.read_text(encoding='utf-8'))
     manifest = provenance(settings, args)
     manifest['suite_sha256'] = file_hash(args.suite)
@@ -204,7 +208,7 @@ def run_evaluation(settings, args):
     for mode in ('original', 'logkv', 'logkv_no_bias'):
         nlls = [r for r in results if r['mode'] == mode and r['kind'] == 'nll']
         mean = sum(r['nll_sum'] for r in nlls) / sum(r['tokens'] for r in nlls)
-        summary[mode] = {'mean_nll': mean, 'perplexity': __import__('math').exp(mean),
+        summary[mode] = {'mean_nll': mean, 'perplexity': math.exp(mean),
                          'tokens': sum(r['tokens'] for r in nlls),
                          'generation_eos_count': sum(r['stop_reason'] == 'eos' for r in results
                                                      if r['mode'] == mode and r['kind'] == 'generation')}

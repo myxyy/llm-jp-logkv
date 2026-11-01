@@ -74,3 +74,10 @@ LogKV core生成時の使わない投影はmeta上で構築し、Identityへ置�
 CPU検証に全モデルdense logits/greedy生成の元Llama一致（FP32/BF16）、
 全層LogKVの分割一致（FP64）、因果性、state非破壊、重み同一性、EOS停止、
 評価NLLのチャンク境界を含む全トークン計数を追加した。
+
+全層拡張時のCPU回帰: **191 passed in 6.24s**。
+GPU smoke: RTX 3090、CUDA_VISIBLE_DEVICES=0、Torch 2.11.0、BF16、seed=29、
+ランダム3層（hidden=32、FFN=56、Q=4、KV=2、head_dim=8、vocab=64）、
+37トークンを7トークンずつ分割。dense/LogKVとも一括との差max/mean=0。
+logical state bytesはdense=7,104、LogKV=2,304。この小モデル・特定長の値であり、
+8Bでのメモリ削減率や速度改善の主張には使わない。
