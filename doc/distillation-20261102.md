@@ -3,7 +3,9 @@
 未蒸留の全層LogKVは初期4問で反復出力になったため、元モデルを教師とする
 出力蒸留を実装した。今回のユーザー指示は「固定減衰・8時間・全6 GPU」であり、
 通常の継続実験に対する最大2 GPUの制約は、この試行に限って明示的に変更された。
-訓練の完了や品質の回復は、実行結果を確認してから判断する。
+8時間の試行は3,126 stepsで正常終了した。全検証集合のKLは4.2622から0.4784に低下し、
+初期比較と同条件の手書き4問では未蒸留0/4から蒸留後2/4となった。
+元モデルは4/4であり、推論品質の保持・十分な回復を示す結果ではない。
 
 ## 実装と条件
 
@@ -135,12 +137,15 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
   `/mnt/raid0/llm-jp-logkv/logs/distill-loss-chunk-benchmark-20261102.json`。
   同測定のlossは設定間で更新を継続したため、品質比較には使用しない。
 
-## 8時間試行の実行記録（進行中）
+## 8時間試行の実行記録
 
 - Run: `distill-fixed-20261101T162321Z-5dfd0965`
 - Source: `ee47991e1b3ed6d194bd704e44a3dde1be5dbbd2`、開始時clean。
 - 訓練開始: **2026-11-02 01:23:50 JST**。
-- 訓練deadline: **2026-11-02 09:23:50 JST**、続けて最終保存・検証・生成比較。
+- 訓練deadline: **2026-11-02 09:23:50 JST**。最終更新は3,126 steps、経過28,801.08秒。
+  step境界で `deadline` により終了し、再開・設定変更はなかった。
+- 最終保存・全件検証・6問生成: **09:26:01 JST**完了、訓練終了コード0。
+- 元モデルとの別プロセス比較: **09:26:50 JST**完了、評価終了コード0。
 - 6 GPU稼働とteacher固定・LoRA 27,262,976 parametersをruntimeで確認。
 - 初期の固定48会話: KL=4.2372867、CE=5.3847451、26,443 tokens。
   全674会話の開始・終了時比較は `validation.jsonl` の `*_all_heldout` を使用する。
@@ -157,7 +162,11 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
 `supervisor-completed.json` を確認する。最終比較の新規artifact directoryは
 `final-evaluation.log` に出力される。起動済みrunを重複起動しない。
 
-最終結果は訓練・評価の終了を確認してから追記する。
+最終checkpointは `step-0003126`。200〜3,000 stepsの15回と合わせて16個を保存した。
+サンプルは初期・15回の定期・最終の計17ファイル、各6問で計102生成を記録した。
+6 rankの最終adapter tensor hashは一致し、最終adapterを別プロセスで読み込んで評価した。
+最終adapterファイルのSHA-256は
+`c80a580201292b1312daa1f03ce720db1051b2e793abe5f3b8fe7d268272a88d`。
 
 ### 定期記録の途中結果
 
@@ -200,7 +209,7 @@ SHA-256は `complete.json` と一致し、訓練は200 steps以降も継続し�
 生の出力はrun内 `samples/periodic-step-0000200.json`、目視判定は
 `reviews/step-0000200.json`、保存確認は `reviews/checkpoint-0000200.json`。
 これは途中の手書きsmoke評価であり、一般的な正答率や推論能力の保持を示すものではない。
-8時間の試行を同じ設定で継続する。
+その後も同じ設定で8時間の試行を継続した。
 
 400 stepsでもEOS終了は6/6、正しい最終回答は首都の1問だけ（元の4問では1/4）。
 算数は17−8=9までは正しいが、入力にない手順を追加して16個と回答した。
@@ -270,3 +279,97 @@ finalと矛盾する。finalの説明でも「買う」を「友だちからも�
 3,000 stepsもEOS終了6/6、正しい最終回答は首都と和訳の2/6（元の4問では1/4）。
 算数はanalysisの14個とfinalの17個が不一致。要約は未提示の平日9〜17時を追加した。
 詳細は `reviews/step-0003000.json`。保存済み2ファイルのSHA-256一致も確認した。
+
+## 最終品質
+
+開始・終了で同じ全674会話、347,922有効トークンを使った。
+定期記録の48会話とは母集団が異なるため、下表同士で比較する。
+
+| 全検証集合 | KL | next-token CE |
+|---|---:|---:|
+| 学習前 | 4.262197 | 5.442251 |
+| 3,126 steps後 | 0.478394 | 1.470831 |
+
+最終6問はEOS終了6/6、正しい最終回答2/6（首都と和訳）。算数はanalysisが14個、
+finalが17個と矛盾し、合言葉は緑チームの「すみれ」を答えた。
+`reviews/final-step-0003126.json` に全文に基づく判定を残した。
+
+元の初期比較と同じ4問・生成上限512・chat date=2026-11-01で、最終adapterを再評価した。
+元モデルの生成token IDsと文章NLLは初期比較と完全一致した。
+モデルrevision・tokenizer・template・質問・入力token IDs・生成設定も同じである。
+
+| 条件 | 正しい最終回答 | EOS終了 | 固定3文章のPPL（182 tokens） |
+|---|---:|---:|---:|
+| 元モデル | 4/4 | 4/4 | 11.7287 |
+| 未蒸留・固定減衰LogKV | 0/4 | 0/4 | 123.7955 |
+| 蒸留後・固定減衰LogKV | 2/4 | 4/4 | 54.4838 |
+
+蒸留後の正答は首都と要約。要約は日曜10〜16時と平日変更なしを保持したが、
+「来月」は省略した。算数の最終回答は17個、合言葉は「すみれ」で誤答。
+最終6問の方はchat date=2026-11-02で、要約は16時を落としていた。
+日付条件が異なる2系列の正答数は混ぜず、上表では初期比較と条件を揃えた結果を使う。
+手書きの短い設問であり、一般的な正答率・長距離品質・推論能力の保持を示さない。
+
+最終比較の成果物:
+
+```text
+/mnt/raid0/llm-jp-logkv/experiments/initial-quality-20261102T002607Z-cf63ef05/
+```
+
+同ディレクトリの `results.jsonl` に全文とtoken IDs、`manual-review.json` に8生成の判定、
+`summary.json` にNLL/PPLを保存した。`dense-equivalence.json` は実重み93 tokensで
+元Llamaとのlogits最大誤差0、argmax一致100%を再確認している。
+
+## 実行性能と検証の範囲
+
+- 3,126 optimizer steps、75,024会話の提示（62,364件に対し約1.203周分）、
+  **38,285,241有効tokens**を処理した。paddingはこのtoken数に含めない。
+- 定期評価・保存・生成を含む8時間で平均 **1,329.30有効tokens/s**。
+  optimizer stepの時間だけでは平均 **1,357.02有効tokens/s**、1 step平均9.025秒。
+- GPU計測157回で、使用率の中央値は6台とも100%、使用メモリ中央値は各20,801 MiB。
+  PyTorchのrank最大割当ピークは19.439 GiB。使用率は標本値であり、全瞬間の保証ではない。
+- 最終4問の生成時間は元モデル0.67〜3.42秒、蒸留後LogKV4.49〜14.40秒。
+  出力長も異なるため、制御された速度比較や高速化の実証とは扱わない。
+- 終了後のCPU回帰テストは **200 passed in 9.51s**。実重みBF16比較の追加確認に伴い、
+  独立FP64参照・grouped/streaming・LoRA・勾配・データ型の既存テストを再確認した。
+  ログとJUnit XMLはこのrunの `logs/` 以下の `cpu-tests-final.*`。
+- 訓練開始時の全 `src/` hash、`uv.lock`、`UPSTREAM.json` の全移植ファイルの一致を確認した。
+  実行中に変更したGit管理ファイルは実験記録のみで、訓練コードと参照コアは同一である。
+
+### 実重みでの一括計算と分割計算
+
+最終adapterを読み込み、学習時のgrouped経路と、128トークン分割＋末尾8トークンの
+1トークンずつの推論経路を比較した。実際の首都93 tokens、算数110 tokens、
+最長の検証会話1,023入力tokensを使い、状態のoffsetも確認した。
+
+GPU BF16では事前に設定した `atol=0.125, rtol=0.02` に3入力とも未達だった。
+logits最大差0.500〜1.016、平均差0.0356〜0.0425、argmax一致99.09〜100%、
+平均KL(grouped || streaming)は0.000587〜0.001338だった。
+この実重みでの厳しい誤差判定を「一致」とは扱わず、BF16の制限として残す。
+CPU FP32では同じ入力と経路が、事前設定 `atol=rtol=1e-4` に3入力とも合格した。
+最大差は93 tokensで3.41e-5、110 tokensで3.58e-5、1,023 tokensで1.31e-4
+（相対許容差込みで合格）。平均差2.03e-6〜2.72e-6、argmax一致は全入力100%だった。
+dtypeとdeviceの両方が異なる比較なので、差の原因をこれだけで一意に断定しない。
+訓練と生成の数値経路を点検できた一方、GPU BF16での完全一致や一般的な誤差上限は保証しない。
+
+検証スクリプトと各入力の数値・token IDsはrun内 `reviews/verify-real-streaming*.py`、
+`reviews/real-streaming-comparison*.json`。これは数値経路の確認であり、生成品質の評価とは別である。
+
+## 完了確認
+
+`reviews/audit-completion.py` と `reviews/completion-audit.json` に終了時の監査を保存した。
+3,126 stepsの連続性・有限な損失と勾配・8時間での終了、6 rankの一致、16 checkpointsの
+重みとoptimizer stateのSHA-256、17サンプルファイルの全6問・token数・終了トークン、
+全データファイルのhash、モデル・データrevision、元モデル対照の再現、200テストを確認した。
+BF16の厳しい数値比較が不合格だったことも、この記録に明記している。
+
+最終checkpointの使用例:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
+  --adapter /mnt/raid0/llm-jp-logkv/checkpoints/distill-fixed-20261101T162321Z-5dfd0965/step-0003126 \
+  --prompt '日本の首都はどこですか。短く答えてください。' --max-new-tokens 512
+```
+
+今回の実装・8時間試行・終了後評価は完了した。回答の取り違えとBF16経路差は残るため、
+品質保持や実用性能を主張せず、次の設計・蒸留条件の比較材料とする。

@@ -9,7 +9,8 @@ TransformersのCache/model.generateへの組み込みは未対応で、独自の
 初期評価では元モデルが4問とも正答した一方、未蒸留LogKVの両条件は反復出力となりました。
 [実重みでの初期品質・性能結果](doc/initial-quality-20261102.md)を参照してください。
 蒸留の設定・データ・再現手順は[蒸留実験記録](doc/distillation-20261102.md)にまとめています。
-品質回復は訓練後の評価で確認します。
+全6 GPU・8時間の蒸留を完了し、同条件の手書き4問は未蒸留0/4から2/4に改善しました。
+元モデルの4/4には届かず、推論品質の保持は確認できていません。
 
 ## 環境
 
@@ -143,7 +144,7 @@ GQA・生成キャッシュ・LoRA の勾配を CPU で確認します。8B モ�
 全語彙KL + next-token CEで学習します。BF16、層checkpoint、語彙損失の分割を用い、
 一定stepごとに生成全文・token IDs・検証損失・再開可能なcheckpointを記録します。
 
-今回はユーザーが全6 GPU・8時間を承認しています。詳細な起動・監視・再開手順と
+ユーザー承認の全6 GPU・8時間試行は3,126 stepsで正常終了しました。詳細な結果・起動・再開手順と
 データrevisionは[蒸留実験記録](doc/distillation-20261102.md)を参照してください。
 蒸留後は `infer --adapter CHECKPOINT_DIR` と `evaluate-initial --adapter CHECKPOINT_DIR`
 で評価できます。通常の `infer` は引き続き未蒸留モデルを使用します。

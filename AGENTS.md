@@ -8,8 +8,12 @@
 - Current status includes standalone full-model Llama/LogKV inference, an initial
   pretrained comparison, and fixed-decay LoRA distillation with DDP and checkpoints.
   See `doc/initial-quality-20261102.md` and `doc/distillation-20261102.md`.
-  The untrained conversion failed the initial smoke prompts. Distillation quality
-  must be established from actual evaluation; do not assume preserved reasoning.
+  The eight-hour, six-GPU trial completed at step 3126. Matched four-prompt smoke
+  results were original 4/4, untrained fixed-decay 0/4, distilled fixed-decay 2/4.
+  Do not imply that reasoning quality is preserved; full-scale BF16 grouped vs
+  streaming logits also exceeded the recorded strict tolerance. The same three
+  real-weight inputs passed the tighter CPU FP32 check; keep these claims separate.
+  See the experiment report.
 
 # Environment and artifacts
 
