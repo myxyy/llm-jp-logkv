@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import subprocess
 
 import numpy as np
 import torch
@@ -12,16 +13,17 @@ DATASET_ID = 'llm-jp/llm-jp-4.1-thinking-sft-data'
 DATASET_REVISION = 'cb4210190af6a0000fd91cb5bb8361ad6d6ade01'
 SUBSETS = ('llmjp_magpie_sft_v1.0', 'logical_math_coding_wizard8x22b',
            'llmjp_extraction_wiki_ja_v0.3')
+SPLITS = ('reasoning_low', 'reasoning_medium', 'reasoning_high')
 
 
-def first_exchange(messages):
+def first_exchange(messages, *, reasoning_effort='low'):
     """Convert public Harmony records to the original tokenizer template API.
 
     The pilot uses the first completed user/assistant exchange. Analysis becomes
     the template's thinking field; final content stays separate. Tool or unknown
     modalities are rejected rather than silently flattened into text.
     """
-    kwargs = {'reasoning_effort': 'low', 'conversation_start_date': '2026-11-02'}
+    kwargs = {'reasoning_effort': reasoning_effort, 'conversation_start_date': '2026-11-02'}
     result, analysis = [], None
     for message in messages:
         role, content = message['role'], message['content']
@@ -64,14 +66,26 @@ def first_exchange(messages):
     raise ValueError('No completed assistant response')
 
 
-def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=30000, seed=20261102):
+def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=100000, seed=20261102,
+                  splits=SPLITS):
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
     from .inference import file_hash, write_json
 
+    splits = tuple(splits)
+    if not splits or len(set(splits)) != len(splits) or any(split not in SPLITS for split in splits):
+        raise ValueError('Choose distinct supported reasoning splits')
+    if candidates_per_subset < 1 or max_length < 64:
+        raise ValueError('candidates_per_subset must be positive and max_length must be >=64')
+    root = settings.paths['DATASET_DIR'] / 'llm-jp-4.1-thinking-sft-data' / DATASET_REVISION
+    paths = {}
+    for subset in SUBSETS:
+        for split in splits:
+            paths[subset,split] = sorted((root/subset).glob(f'{split}-*.parquet'))
+            if not paths[subset,split]:
+                raise FileNotFoundError(f'No downloaded shards for {subset}/{split}')
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    root = settings.paths['DATASET_DIR'] / 'llm-jp-4.1-thinking-sft-data' / DATASET_REVISION
     tokenizer = AutoTokenizer.from_pretrained(settings.model_path, local_files_only=True)
     offsets, records, train, valid = [0], [], [], []
     counts, sources, seen = {}, [], set()
@@ -79,43 +93,55 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=30
     with (output/'tokens.bin').open('xb') as tokens_file:
         for subset in SUBSETS:
             reservoir, n = [], 0
-            for path in sorted((root/subset).glob('reasoning_low-*.parquet')):
-                sources.append({'path':str(path),'sha256':file_hash(path)})
-                for batch in pq.ParquetFile(path).iter_batches(batch_size=256):
-                    for row in batch.to_pylist():
-                        n += 1
-                        if len(reservoir) < candidates_per_subset:
-                            reservoir.append(row)
-                        else:
-                            slot = rng.randrange(n)
-                            if slot < candidates_per_subset:
-                                reservoir[slot] = row
-            if not n:
-                raise FileNotFoundError(f'No downloaded rows for {subset}')
+            by_split = {split:{'source_rows':0,'candidates':0,'accepted':0,
+                              'unsupported':0,'too_short_or_long':0,'duplicate':0} for split in splits}
+            # One reservoir per subset across all selected splits, not N per split.
+            for split in splits:
+                for path in paths[subset,split]:
+                    sources.append({'subset':subset,'split':split,'path':str(path),'sha256':file_hash(path)})
+                    for batch in pq.ParquetFile(path).iter_batches(batch_size=256):
+                        for row in batch.to_pylist():
+                            n += 1
+                            by_split[split]['source_rows'] += 1
+                            if len(reservoir) < candidates_per_subset:
+                                reservoir.append((split,row))
+                            else:
+                                slot = rng.randrange(n)
+                                if slot < candidates_per_subset:
+                                    reservoir[slot] = (split,row)
+                if not by_split[split]['source_rows']:
+                    raise ValueError(f'No downloaded rows for {subset}/{split}')
+            for split,row in reservoir:
+                by_split[split]['candidates'] += 1
             counts[subset] = {'source_rows':n, 'candidates':len(reservoir), 'accepted':0,
-                              'unsupported':0, 'too_short_or_long':0, 'duplicate':0}
+                              'unsupported':0, 'too_short_or_long':0, 'duplicate':0,'splits':by_split}
             for begin in range(0,len(reservoir),128):
-                texts, identifiers, groups = [], [], []
-                for row in reservoir[begin:begin+128]:
+                texts, identifiers, groups, origins = [], [], [], []
+                for split,row in reservoir[begin:begin+128]:
                     try:
-                        messages, kwargs = first_exchange(json.loads(row['messages']))
+                        messages, kwargs = first_exchange(json.loads(row['messages']),
+                                                         reasoning_effort=split.removeprefix('reasoning_'))
                         # Group split by conversation content, independent of date/ID.
                         group = hashlib.sha256(json.dumps(messages,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
                         text = tokenizer.apply_chat_template(messages, tokenize=False,
                                                              add_generation_prompt=False, **kwargs)
                     except (ValueError,KeyError,TypeError):
                         counts[subset]['unsupported'] += 1
+                        by_split[split]['unsupported'] += 1
                         continue
                     texts.append(text); identifiers.append(row['ID']); groups.append(group)
+                    origins.append(split)
                 if not texts:
                     continue
                 encoded = tokenizer(texts, add_special_tokens=False, return_attention_mask=False)['input_ids']
-                for ids, identifier, group in zip(encoded, identifiers, groups):
+                for ids, identifier, group, split in zip(encoded, identifiers, groups, origins):
                     if not 64 <= len(ids) <= max_length:
                         counts[subset]['too_short_or_long'] += 1
+                        by_split[split]['too_short_or_long'] += 1
                         continue
                     if group in seen:
                         counts[subset]['duplicate'] += 1
+                        by_split[split]['duplicate'] += 1
                         continue
                     seen.add(group)
                     index = len(records)
@@ -123,8 +149,9 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=30
                     tokens = np.asarray(ids, dtype=np.uint32)
                     tokens_file.write(tokens.tobytes())
                     offsets.append(offsets[-1]+len(ids))
-                    records.append({'subset':subset,'id':identifier,'group_hash':group,'length':len(ids)})
+                    records.append({'subset':subset,'split':split,'id':identifier,'group_hash':group,'length':len(ids)})
                     counts[subset]['accepted'] += 1
+                    by_split[split]['accepted'] += 1
             print(subset,counts[subset],flush=True)
     np.save(output/'offsets.npy',np.asarray(offsets,dtype=np.uint64))
     np.save(output/'train.npy',np.asarray(train,dtype=np.int64))
@@ -132,8 +159,14 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=30
     with (output/'records.jsonl').open('x',encoding='utf-8') as stream:
         for row in records:
             stream.write(json.dumps(row,ensure_ascii=False)+'\n')
-    manifest = {'dataset_id':DATASET_ID,'revision':DATASET_REVISION,'split':'reasoning_low',
+    manifest = {'dataset_id':DATASET_ID,'revision':DATASET_REVISION,'splits':list(splits),
                 'subsets':list(SUBSETS),'sources':sources,'counts':counts,'seed':seed,
+                'candidates_per_subset':candidates_per_subset,
+                'sampling':'uniform reservoir per subset over all selected splits; no fixed split quotas',
+                'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                'source_dirty':bool(subprocess.check_output(['git','status','--porcelain'],text=True).strip()),
+                'source_files_sha256':{str(p):file_hash(p) for p in
+                    (Path(__file__), Path('scripts/prepare_distillation_data.py'))},
                 'train_examples':len(train),'valid_examples':len(valid),'tokens':offsets[-1],
                 'max_length':max_length,'format':'uint32, variable length, first completed exchange, no truncation',
                 'tokenizer_revision':settings.model_revision,
