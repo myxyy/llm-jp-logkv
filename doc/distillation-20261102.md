@@ -1,13 +1,16 @@
 # 固定減衰LogKVの蒸留（2026-11-02）
 
 未蒸留の全層LogKVは初期4問で反復出力になったため、元モデルを教師とする
-出力蒸留を実装した。今回のユーザー指示は「固定減衰・8時間・全6 GPU」であり、
+出力蒸留を実装した。初回の蒸留試行に対するユーザー指示は「固定減衰・8時間・全6 GPU」であり、
 通常の継続実験に対する最大2 GPUの制約は、この試行に限って明示的に変更された。
 8時間の試行は3,126 stepsで正常終了した。全検証集合のKLは4.2622から0.4784に低下し、
 初期比較と同条件の手書き4問では未蒸留0/4から蒸留後2/4となった。
 元モデルは4/4であり、推論品質の保持・十分な回復を示す結果ではない。
 
 ## 実装と条件
+
+以下の条件表は完了済みの8時間試行の記録。現在の通常起動・再開コマンドは
+[実行と再開](#実行と再開)を参照する。
 
 | 項目 | 設定 |
 |---|---|
@@ -33,7 +36,7 @@
 `logkv/attention.py` は `UPSTREAM.json` のSHA-256と一致する無改変コアのまま。
 DDPの平均化と勾配蓄積に合わせて、全rankの有効トークン数で損失を正規化する。
 
-8時間は初期検証・サンプル、定期保存・検証・生成を含む訓練開始後のwall time。
+この試行の8時間は初期検証・サンプル、定期保存・検証・生成を含む訓練開始後のwall time。
 起動時のモデル読込は含まず、終了時の保存・検証・生成と別プロセスの最終比較が
 短い後処理として加わる。再開時も元の開始時刻を保持し、停止中の時間を含めるため、
 再開のたびに8時間の予算を追加しない。
@@ -82,28 +85,83 @@ HF_HUB_DISABLE_XET=1 ./scripts/uv.sh run --locked python scripts/prepare_distill
 現在の既定値は **時間制限なし・1 epoch**。`--max-hours` の省略は無制限、
 `--num-epochs` の省略は1となる。`--num-epochs N` は再開前からの通算周回数を表す。
 時間やstepの上限も指定した場合は、最初に達した条件で保存して終了する。
-以下のコマンドは既定の手動起動とは別に、前回の8時間試行の条件を明示したもの。
 
 新規学習には新しい `--run-name` を使う。再開は同じrun名に `--resume latest` を追加する。
 `--run-dir`・`--log-dir` は廃止し、設定済みの保存先ルートとrun名から自動決定する。
-これは今回承認された6 GPUのコマンドであり、将来の長時間実験の包括承認ではない。
+オプション区切りの `--` は不要。以下は `.env` の既定配置を使う例で、保存先を変更した環境では
+`distill_root` と各パスをその設定に合わせる。
+
+### 新規開始（2 GPU・1 epoch）
+
+run名 `my-distillation` は新規学習ごとに変更する。GPUあたりbatch size=1、勾配蓄積12回で
+global batch=24。時間上限は指定せず、checkpointは最新2個を保持する。
 
 ```bash
+cd /home/myxy/llm-jp-logkv
+distill_run=my-distillation
+distill_root=/mnt/raid0/llm-jp-logkv
 ./scripts/uv.sh run --locked python scripts/run_distillation.py \
-  --gpus 0,1,2,3,4,5 \
-  --run-name NEW-RUN --evaluate-final \
-  --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-20261101T155341Z-4326ce39 \
-  --num-epochs 0 --max-hours 8 --sequence-length 1024 --batch-size 1 --grad-accum 4 \
-  --rank 32 --alpha 64 --chunk-size 4 --loss-chunk-tokens 512 \
-  --temperature 1 --ce-weight 0.1 --lr 1e-4 --warmup-steps 50 \
-  --sample-every 200 --save-every 200 --validate-every 200 \
-  --val-examples-per-rank 8 --sample-max-new-tokens 256 --seed 20261102
+  --run-name "$distill_run" --gpus 0,1 --evaluate-final \
+  --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
+  --num-epochs 1 --batch-size 1 --grad-accum 12 \
+  --sample-every 200 --save-every 200 --max-checkpoints 2 --validate-every 200
 ```
 
-supervisorはtorchrunの終了コードを保存し、成功時には最終adapterと元モデルの
-比較をGPU 0で行う。切断後も実行する場合はsupervisorを別sessionで起動する。
+### 同じrunの最新checkpointから再開
+
+上の例を中断後に再開するコマンド。run名・GPU台数・データ・訓練設定を前回と揃え、
+`--resume latest` を追加する。前回のコマンドで変更したモデル・optimizer等の引数も同じ値を渡す。
+
+```bash
+cd /home/myxy/llm-jp-logkv
+distill_run=my-distillation
+distill_root=/mnt/raid0/llm-jp-logkv
+./scripts/uv.sh run --locked python scripts/run_distillation.py \
+  --run-name "$distill_run" --resume latest --gpus 0,1 --evaluate-final \
+  --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
+  --num-epochs 1 --batch-size 1 --grad-accum 12 \
+  --sample-every 200 --save-every 200 --max-checkpoints 2 --validate-every 200
+```
+
+`latest` は保存完了済みの最大stepを選び、未完了・一時ディレクトリは対象外。
+該当checkpointがない場合はエラーにし、新規学習へ切り替えない。
+`--resume step-0000200` やcheckpointのパスも指定できる。
+既存runで再開できるのはそのrunの最新checkpointのみ。古いstepから分岐する場合は
+新しいrun名と元checkpointのパスを指定する。同じrunの二重起動はロックで拒否する。
+
+### ログ・保存先の確認
+
+supervisorはtorchrunの終了コードを保存する。`--evaluate-final` 指定時には通常終了後に
+最終adapterと元モデルを比較し、`--gpus` の先頭のGPU（上の例ではGPU 0）を使う。
+切断後も実行する場合はtmux等のsession内で起動する。
 `${LOG_DIR}/RUN/latest/process.json` にPIDとLinuxのprocess start ticksを記録する。
 監視呼び出しのtimeoutだけで再起動せず、PIDの一致とmetricsの更新を確認する。
+
+| 内容 | 現在の保存先 |
+|---|---|
+| 訓練ログ（追記） | `${LOG_DIR}/RUN/training.log` |
+| step metrics・検証損失（追記） | `${EXPERIMENT_DIR}/RUN/metrics.jsonl`、`validation.jsonl` |
+| 今回の起動設定・終了結果・生成例 | `${EXPERIMENT_DIR}/RUN/latest/manifest.json`、`completed.json`、`samples/` |
+| 今回のsupervisorの終了コード・比較評価ログ | `${LOG_DIR}/RUN/latest/training-exit.json`、`evaluation-exit.json`、`final-evaluation.log` |
+| checkpoint | `${CHECKPOINT_DIR}/RUN/step-NNNNNNN/` |
+
+`RUN` は `--run-name` の値。`latest/` の実体は起動ごとの `sessions/ID/` にあり、
+再開前の設定・終了記録・生成例も残る。終了結果のファイルは各処理の完了後に作成される。
+`--evaluate-final` の省略時や `save_and_exit` 中断時には比較評価のログは作成されない。
+
+既定配置での確認例（別ターミナル）:
+
+```bash
+distill_run=my-distillation
+distill_root=/mnt/raid0/llm-jp-logkv
+tail -n 50 "$distill_root/logs/$distill_run/training.log"
+tail -n 5 "$distill_root/experiments/$distill_run/metrics.jsonl"
+# 終了後に確認する
+cat "$distill_root/experiments/$distill_run/latest/completed.json"
+cat "$distill_root/logs/$distill_run/latest/training-exit.json"
+```
+
+### checkpointの保持と旧runの扱い
 
 checkpointは `${CHECKPOINT_DIR}/RUN/step-NNNNNNN/` に保存する。
 `adapter.pt`、optimizer/RNG/data cursor入り `training_state.pt`、設定、
@@ -114,24 +172,12 @@ checkpointは `${CHECKPOINT_DIR}/RUN/step-NNNNNNN/` に保存する。
 step番号順で最新N個だけ残す。新規保存完了後にrank 0が古いものを削除するため、
 保存中は一時的にN＋1個分の容量が必要になる。保存失敗時には古いcheckpointを削除しない。
 定期保存・通常終了・`save_and_exit`の保存すべてに適用し、同じstepの二重保存は1個と数える。
-削除履歴はrun-dirの `checkpoint-pruning.jsonl` とtraining.logに残す。
+削除履歴は `${EXPERIMENT_DIR}/RUN/checkpoint-pruning.jsonl` とtraining.logに残す。
 未完了・不明なディレクトリ、別runのcheckpointは整理対象外。
 再開時に保持数を変更でき、同じrunでは再開前のcheckpointも保持数に含める。
 別runからパス指定で再開した場合、再開元の別runは整理対象外となる。
 後述する8時間試行で16個すべてを保存したのは、この保持数制限の追加前の挙動である。
 
-再開は同じ並列数・データ・訓練設定・run名に `--resume latest` を指定する。
-最新とは保存完了済みの最大stepで、未完了・一時ディレクトリは対象外。
-該当checkpointがない場合はエラーにし、新規学習へ切り替えない。
-`--resume step-0000200` やcheckpointのパスも指定できる。
-既存runで再開できるのはそのrunの最新checkpointのみ。古いstepから分岐する場合は
-新しいrun名と元checkpointのパスを指定する。同じrunの二重起動はロックで拒否する。
-
-`${LOG_DIR}/RUN/training.log` と `${EXPERIMENT_DIR}/RUN/` のmetrics・validation等のJSONLは追記する。
-各起動のmanifest・runtime・started・completedとsamplesは
-`${EXPERIMENT_DIR}/RUN/sessions/ID/`、supervisorの終了記録と比較評価ログは
-`${LOG_DIR}/RUN/sessions/ID/` に分け、両方の `latest/` シンボリックリンクから最新起動を参照できる。
-再開や同stepでの即時終了でも過去のサンプル・終了記録と衝突しない。
 旧版のrun直下にある記録は保持し、新版の再開後の記録は `latest/` で確認する。
 従来の `checkpoints/RUN/step-NNNNNNN` も移動せず同じrun名で再開可能。
 新規checkpointは一時ディレクトリに保存し、保存完了後に公開する。
@@ -141,6 +187,8 @@ run名対応はCPU 270 testsと実重み2 GPUの3回起動で検証した。
 同じrunでstep 1の保存中断からlatestでstep 4へ再開し、さらに同stepでの再開も成功した。
 step 3/4の2 checkpointだけを保持し、ログ追記・起動記録の保持・終了後評価を確認した。
 記録は `logs/named-run-smoke-20261102T120616Z-6af80b-validation.json`（RAID配下）。
+
+### 終了条件と学習率
 
 epoch数・時間・stepの上限は再開時に変更できる。旧checkpointに記録された `max_hours=8` は
 訓練設定の互換性検査から分離したため、`--max-hours` を省いて時間上限を外せる。
@@ -166,7 +214,7 @@ epoch末尾は残りのミニバッチ数で最後の勾配蓄積・DDP同期を
 旧版の期限切れcheckpointから時間制限を外す再開も確認済み。
 記録は `logs/epoch-default-20261102T104125Z-validation.json`（RAID配下）。
 
-### control.cmdによる保存・中断（試行完了後に追加）
+### control.cmdによる保存・中断
 
 手動操作は次のとおり。uv wrapperの実行ディレクトリであるプロジェクト直下を既定の場所とする。
 
@@ -178,15 +226,16 @@ printf 'save_and_exit\n' > control.cmd
 rank 0だけがコマンドを読み、全rankへ同じ終了理由をbroadcastする。
 実行中のoptimizer step・検証・サンプル生成が終わったstep境界で、adapter、optimizer、
 各rankのRNG、epoch内のデータ位置を保存して終了コード0で停止する。
-受理したファイルは削除し、`latest/completed.json` に `reason="save_and_exit"` とcheckpointパスを記録する。
+受理したファイルは削除し、`${EXPERIMENT_DIR}/RUN/latest/completed.json` に
+`reason="save_and_exit"` とcheckpointパスを記録する。
 この場合の終了後全件検証と生成は省き、`validation` はnullになる。
 supervisorに `--evaluate-final` があっても比較評価を省き、ログ側の `latest/evaluation-skipped.json` を記録する。
 
 起動コマンドに `--control-file PATH` を追加すると監視先を変更できる。
 複数runは同じ制御ファイルを共有せず、たとえばrunごとの絶対パスを指定する。
 空・未認識の内容では停止せず、ファイルも削除しない。対応コマンドは `save_and_exit`。
-既存のrun-dir内 `STOP` による停止は引き続き使え、従来どおり終了時の検証・生成を実施する。
-新規起動のコピー可能な2 GPUコマンドは[README](../README.md#固定減衰logkvの蒸留)に記載した。
+`${EXPERIMENT_DIR}/RUN/STOP` による停止も使え、終了時の検証・生成を実施する。
+`STOP` ファイルは自動削除されないため、この方式で停止した場合は再開前に取り除く。
 
 追加機能の検証: CPU **214 passed in 10.91s**。2 rankのGlooでコマンドをrank 0だけが
 読み、全rankへ同じ終了理由が伝わることを確認した。実重み2 GPUの短いsmokeでは
@@ -199,6 +248,10 @@ optimizerのstepとデータ位置が1→2へ進み、元の開始時刻と訓�
 run名は `control-smoke-20261102T014430Z` と `control-resume-20261102T014553Z` で、
 同じRAIDルートの `experiments/`、`logs/`、`checkpoints/` に成果物を保存した。
 
+### 保存したcheckpointで推論
+
+`RUN` と `step-NNNNNNN` を実際に保持されているcheckpointへ置き換える。
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
   --adapter /mnt/raid0/llm-jp-logkv/checkpoints/RUN/step-NNNNNNN \
@@ -206,6 +259,9 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
 ```
 
 ## 検証記録
+
+以下は初回の蒸留実装・8時間試行前の検証履歴。
+run名・同一run再開対応時点のCPU回帰は270 testsで、操作検証は上の各項に記載した。
 
 - CPU: **200 tests passed**。FP64 grouped/streaming出力・勾配一致、teacher不変、
   LoRA更新後の全モデルgrouped/streaming一致（FP64とBF16）、
@@ -231,6 +287,26 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
 
 ## 8時間試行の実行記録
 
+### 参考：現行CLIで6 GPU・8時間の条件を指定する例
+
+前回の主要ハイパーパラメータを現行CLIで指定する参考例。
+現在の保持数は既定で2個であり、全16 checkpointを残した当時の保存方式とは異なる。
+当時の6 GPU・8時間の承認は、その完了済み試行に限る。
+
+```bash
+cd /home/myxy/llm-jp-logkv
+./scripts/uv.sh run --locked python scripts/run_distillation.py \
+  --run-name NEW-8H-RUN --gpus 0,1,2,3,4,5 --evaluate-final \
+  --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-20261101T155341Z-4326ce39 \
+  --num-epochs 0 --max-hours 8 --sequence-length 1024 --batch-size 1 --grad-accum 4 \
+  --rank 32 --alpha 64 --chunk-size 4 --loss-chunk-tokens 512 \
+  --temperature 1 --ce-weight 0.1 --lr 1e-4 --warmup-steps 50 \
+  --sample-every 200 --save-every 200 --max-checkpoints 2 --validate-every 200 \
+  --val-examples-per-rank 8 --sample-max-new-tokens 256 --seed 20261102
+```
+
+### 当時の起動・終了と成果物
+
 - Run: `distill-fixed-20261101T162321Z-5dfd0965`
 - Source: `ee47991e1b3ed6d194bd704e44a3dde1be5dbbd2`、開始時clean。
 - 訓練開始: **2026-11-02 01:23:50 JST**。
@@ -248,11 +324,14 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
 | torchrunログ、PID、終了コード | `/mnt/raid0/llm-jp-logkv/logs/distill-fixed-20261101T162321Z-5dfd0965/` |
 | checkpoint | `/mnt/raid0/llm-jp-logkv/checkpoints/distill-fixed-20261101T162321Z-5dfd0965/` |
 
+この試行はrun名・session対応前の保存形式であり、以下は当時の成果物のパス。
+現在の起動では[ログ・保存先の確認](#ログ保存先の確認)に記載した `latest/` を使う。
+
 `samples/initial-step-0000000.json`、`samples/periodic-step-NNNNNNN.json`、
-`samples/final-step-NNNNNNN.json` に6問を保存する。訓練終了後はrunの
+`samples/final-step-NNNNNNN.json` に6問を保存した。終了結果はrunの
 `completed.json` とログの `training-exit.json`、`evaluation-exit.json`、
-`supervisor-completed.json` を確認する。最終比較の新規artifact directoryは
-`final-evaluation.log` に出力される。起動済みrunを重複起動しない。
+`supervisor-completed.json` に記録した。最終比較の新規artifact directoryは
+`final-evaluation.log` に出力されている。
 
 最終checkpointは `step-0003126`。200〜3,000 stepsの15回と合わせて16個を保存した。
 サンプルは初期・15回の定期・最終の計17ファイル、各6問で計102生成を記録した。
