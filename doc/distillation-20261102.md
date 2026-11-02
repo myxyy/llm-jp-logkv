@@ -109,6 +109,17 @@ supervisorはtorchrunの終了コードを保存し、成功時には最終adapt
 checkpointは `${CHECKPOINT_DIR}/RUN/step-NNNNNNN/` に保存する。
 `adapter.pt`、optimizer/RNG/data cursor入り `training_state.pt`、設定、
 チェックサム入り `complete.json` が揃ったものだけを使用する。
+
+保持数は本体LogKVと同じ **`--max-checkpoints N`（既定値2、1以上の整数）**で指定する。
+`scripts/run_distillation.py` の `--` より後に渡す。現在のrunの保存完了済みcheckpointを
+step番号順で最新N個だけ残す。新規保存完了後にrank 0が古いものを削除するため、
+保存中は一時的にN＋1個分の容量が必要になる。保存失敗時には古いcheckpointを削除しない。
+定期保存・通常終了・`save_and_exit`の保存すべてに適用し、同じstepの二重保存は1個と数える。
+削除履歴はrun-dirの `checkpoint-pruning.jsonl` とtraining.logに残す。
+未完了・不明なディレクトリ、別runのcheckpointは整理対象外。
+再開時に保持数を変更できるが、再開元runのcheckpointはそのまま残る。
+後述する8時間試行で16個すべてを保存したのは、この保持数制限の追加前の挙動である。
+
 再開は同じ並列数・訓練設定と新しいrun/log-dirに `--resume CHECKPOINT` を指定する。
 epoch数・時間・stepの上限は再開時に変更できる。旧checkpointに記録された `max_hours=8` は
 訓練設定の互換性検査から分離したため、`--max-hours` を省いて時間上限を外せる。

@@ -160,7 +160,7 @@ distill_root=/mnt/raid0/llm-jp-logkv
   --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
   --run-dir "$distill_root/experiments/$distill_run" \
   --batch-size 1 --grad-accum 12 \
-  --sample-every 200 --save-every 200 --validate-every 200
+  --sample-every 200 --save-every 200 --max-checkpoints 2 --validate-every 200
 ```
 
 `--max-hours` の省略時は時間無制限、`--num-epochs` の既定値は1です。
@@ -168,6 +168,11 @@ distill_root=/mnt/raid0/llm-jp-logkv
 epoch数・時間・step数を複数指定した場合は、最初に達した上限で保存して終了します。
 epoch末尾の勾配蓄積が指定回数に満たなくても、残りのミニバッチを更新してから終了します。
 学習率は既定ではepochの進捗に応じて減衰し、経過時間には依存しません。
+
+チェックポイントはrunごとに最新2個を保持します。本体LogKVと同じ `--max-checkpoints N`
+（1以上の整数、既定値2）で変更できます。上の例と同様に、起動コマンドの `--` より後へ指定します。
+新しい保存の完了後に古いstepを削除し、通常終了・`save_and_exit`による保存も保持数に含めます。
+再開時に保持数を変更できます。整理対象は現在のrunのみで、再開元の別runには適用しません。
 
 6 GPUにする場合は `--gpus 0,1,2,3,4,5 --grad-accum 4`。
 前回のようにepoch数を制限せず8時間で区切る場合は、さらに `--num-epochs 0 --max-hours 8` を指定します。

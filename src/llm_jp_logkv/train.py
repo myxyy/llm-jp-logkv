@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import time
 
@@ -57,6 +58,8 @@ def parse_args():
     p.add_argument('--warmup-steps',type=int,default=50)
     p.add_argument('--sample-every',type=int,default=200)
     p.add_argument('--save-every',type=int,default=200)
+    p.add_argument('--max-checkpoints',type=int,default=2,
+                   help='Keep the latest N completed checkpoints per run (default: 2; must be >=1)')
     p.add_argument('--validate-every',type=int,default=200)
     p.add_argument('--val-examples-per-rank',type=int,default=8)
     p.add_argument('--sample-max-new-tokens',type=int,default=256)
@@ -71,6 +74,8 @@ def parse_args():
         p.error('--num-epochs and --max-steps must be nonnegative')
     if args.num_epochs==0 and args.max_hours is None and args.max_steps==0:
         p.error('--num-epochs 0 requires --max-hours or --max-steps')
+    if args.max_checkpoints<1:
+        p.error('--max-checkpoints must be >=1')
     if args.chunk_size < 2 or min(args.sample_every,args.save_every,args.validate_every) < 1:
         p.error('Invalid duration, chunk size, or event interval')
     if not args.run_dir.resolve().is_relative_to(SETTINGS.paths['EXPERIMENT_DIR'].resolve()):
@@ -179,6 +184,33 @@ def training_control(args, step, elapsed, stop_requested, device, *, epoch, batc
     return elapsed,STOP_REASONS[int(reason_code)],lr
 
 
+def prune_checkpoints(root, run_dir, keep):
+    """Rank zero prunes only complete checkpoints owned by this run, by step."""
+    if keep<1:
+        raise ValueError('Checkpoint retention must be >=1')
+    completed=[]
+    for path in root.glob('step-*'):
+        number=path.name.removeprefix('step-')
+        if not number.isascii() or not number.isdecimal() or path.is_symlink() or not path.is_dir():
+            continue
+        if not all((path/name).is_file() for name in ('adapter.pt','training_state.pt','config.json','complete.json')):
+            continue
+        try:
+            metadata=json.loads((path/'complete.json').read_text())
+        except (OSError,ValueError):
+            continue
+        if (not isinstance(metadata,dict) or metadata.get('step')!=int(number)
+                or not isinstance(metadata.get('source_run'),str)
+                or Path(metadata['source_run']).resolve()!=run_dir.resolve()):
+            continue
+        completed.append((int(number),path))
+    for step,path in sorted(completed)[:-keep]:
+        shutil.rmtree(path)
+        emit(run_dir,'checkpoint-pruning.jsonl',{'step':step,'path':str(path),
+             'max_checkpoints':keep,'deleted_at':datetime.now(timezone.utc).isoformat()})
+        print(f'Pruned checkpoint step={step} path={path}',flush=True)
+
+
 def save_checkpoint(model, optimizer, args, step, epoch, batch_in_epoch, elapsed, world, rank):
     local_rng={'cpu':torch.get_rng_state(),'cuda':torch.cuda.get_rng_state()}
     rngs=[None]*world if rank==0 else None
@@ -189,6 +221,9 @@ def save_checkpoint(model, optimizer, args, step, epoch, batch_in_epoch, elapsed
         if path.exists():
             if not (path/'complete.json').is_file():
                 raise RuntimeError(f'Incomplete existing checkpoint: {path}')
+            complete=json.loads((path/'complete.json').read_text())
+            if complete['step']!=step or Path(complete['source_run']).resolve()!=args.run_dir.resolve():
+                raise RuntimeError(f'Existing checkpoint belongs to another run or step: {path}')
         else:
             path.mkdir(parents=True,exist_ok=False)
             torch.save(adapter_state(model.student),path/'adapter.pt')
@@ -203,6 +238,8 @@ def save_checkpoint(model, optimizer, args, step, epoch, batch_in_epoch, elapsed
                        'source_run':str(args.run_dir),'data_manifest_sha256':file_hash(args.data/'manifest.json')})
         emit(args.run_dir,'checkpoints.jsonl',{'step':step,'path':str(path),'elapsed_seconds':elapsed})
         print(f'checkpoint step={step} path={path}',flush=True)
+        # Never prune before all checkpoint files and the completion marker are saved.
+        prune_checkpoints(root,args.run_dir,args.max_checkpoints)
     dist.barrier()
     return path
 
@@ -378,6 +415,7 @@ def main():
         print(f'Training limits: epochs={args.num_epochs or "unlimited"}, '
               f'time={str(args.max_hours)+" hours" if args.max_hours is not None else "unlimited"}, '
               f'steps={args.max_steps or "unlimited"}; batches per epoch/rank={len(loader)}',flush=True)
+        print(f'Checkpoint retention: latest {args.max_checkpoints} completed checkpoints per run',flush=True)
     initial_validation=validate(model,val_loader,device)
     if rank==0:
         emit(args.run_dir,'validation.jsonl',{'step':step,'phase':'initial',**initial_validation})
