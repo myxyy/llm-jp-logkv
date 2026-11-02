@@ -105,7 +105,41 @@ checkpointは `${CHECKPOINT_DIR}/RUN/step-NNNNNNN/` に保存する。
 `adapter.pt`、optimizer/RNG/data cursor入り `training_state.pt`、設定、
 チェックサム入り `complete.json` が揃ったものだけを使用する。
 再開は同じ並列数・訓練設定と新しいrun/log-dirに `--resume CHECKPOINT` を指定する。
-計画的に止める場合はrun-dir内へ `STOP` ファイルを作ると、step境界で終了処理する。
+`--max-hours` も再開前と同じ値を使う。停止中の時間を含めた元のwall time上限を保持するため、
+上限を過ぎたcheckpointをそのまま再開しても学習時間は増えない。
+
+### control.cmdによる保存・中断（試行完了後に追加）
+
+手動操作は次のとおり。uv wrapperの実行ディレクトリであるプロジェクト直下を既定の場所とする。
+
+```bash
+cd /home/myxy/llm-jp-logkv
+printf 'save_and_exit\n' > control.cmd
+```
+
+rank 0だけがコマンドを読み、全rankへ同じ終了理由をbroadcastする。
+実行中のoptimizer step・検証・サンプル生成が終わったstep境界で、adapter、optimizer、
+各rankのRNG、epoch内のデータ位置を保存して終了コード0で停止する。
+受理したファイルは削除し、`completed.json` に `reason="save_and_exit"` とcheckpointパスを記録する。
+この場合の終了後全件検証と生成は省き、`validation` はnullになる。
+supervisorに `--evaluate-final` があっても比較評価を省き、`evaluation-skipped.json` を記録する。
+
+起動コマンドの `--` より後に `--control-file PATH` を追加すると監視先を変更できる。
+複数runは同じ制御ファイルを共有せず、たとえばrunごとの絶対パスを指定する。
+空・未認識の内容では停止せず、ファイルも削除しない。対応コマンドは `save_and_exit`。
+既存のrun-dir内 `STOP` による停止は引き続き使え、従来どおり終了時の検証・生成を実施する。
+新規起動のコピー可能な2 GPUコマンドは[README](../README.md#固定減衰logkvの蒸留)に記載した。
+
+追加機能の検証: CPU **214 passed in 10.91s**。2 rankのGlooでコマンドをrank 0だけが
+読み、全rankへ同じ終了理由が伝わることを確認した。実重み2 GPUの短いsmokeでは
+step 1でコマンドを発行して保存・正常終了し、別runからstep 2まで再開できた。
+optimizerのstepとデータ位置が1→2へ進み、元の開始時刻と訓練設定を維持している。
+中断時は終了後評価が省かれ、再開後の通常終了では検証・生成・比較評価が実行された。
+生成上限4、系列長128、LoRA rank 2の操作検証であり、品質実験ではない。
+保存・再開の両checkpointはchecksum一致、各runの2 rankの重みも一致した。
+記録は `/mnt/raid0/llm-jp-logkv/logs/control-command-validation-20261102.json`。
+run名は `control-smoke-20261102T014430Z` と `control-resume-20261102T014553Z` で、
+同じRAIDルートの `experiments/`、`logs/`、`checkpoints/` に成果物を保存した。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \

@@ -149,6 +149,38 @@ GQA・生成キャッシュ・LoRA の勾配を CPU で確認します。8B モ�
 蒸留後は `infer --adapter CHECKPOINT_DIR` と `evaluate-initial --adapter CHECKPOINT_DIR`
 で評価できます。通常の `infer` は引き続き未蒸留モデルを使用します。
 
+手動で新しく開始する例（2 GPU、global batch=24）。run名は毎回変えてください。
+
+```bash
+cd /home/myxy/llm-jp-logkv
+distill_run="manual-$(date +%Y%m%d-%H%M%S)-$$"
+distill_root=/mnt/raid0/llm-jp-logkv
+./scripts/uv.sh run --locked python scripts/run_distillation.py \
+  --gpus 0,1 --log-dir "$distill_root/logs/$distill_run" --evaluate-final -- \
+  --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
+  --run-dir "$distill_root/experiments/$distill_run" \
+  --max-hours 8 --batch-size 1 --grad-accum 12 \
+  --sample-every 200 --save-every 200 --validate-every 200
+```
+
+前回と同じ6 GPUの条件にする場合は `--gpus 0,1,2,3,4,5 --grad-accum 4`。
+ログは `logs/$distill_run/training.log` に出ます。切断後も動かす場合はtmux等から起動します。
+
+別ターミナルから以下を書き込むと、現在の処理が終わったstep境界で全rankが同期し、
+重み・optimizer・RNG・データ位置を保存して正常終了します。
+
+```bash
+cd /home/myxy/llm-jp-logkv
+printf 'save_and_exit\n' > control.cmd
+```
+
+`control.cmd` は受理時に削除され、中断時の終了後評価・生成は省きます。
+複数runでは起動時の `--` より後に `--control-file /絶対パス/control.cmd` を指定し、
+runごとに別のファイルを使ってください。
+再開は同じGPU台数・訓練設定と新しいrun/log名で `--resume CHECKPOINT_DIR` を追加します。
+時間上限は元の開始時刻から計算し、停止中の時間も含みます。
+保存先・再開条件の詳細は[停止・再開手順](doc/distillation-20261102.md#実行と再開)を参照してください。
+
 ## 配置と次の作業
 
 - `src/llm_jp_logkv/logkv/attention.py`: LogKV コアの無改変コピー

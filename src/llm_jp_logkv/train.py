@@ -35,6 +35,8 @@ def parse_args():
     p.add_argument('--data',type=Path,required=True)
     p.add_argument('--run-dir',type=Path,required=True)
     p.add_argument('--resume',type=Path)
+    p.add_argument('--control-file',type=Path,default=Path('control.cmd'),
+                   help='Write save_and_exit here to checkpoint and stop at a step boundary')
     p.add_argument('--max-hours',type=float,default=8.)
     p.add_argument('--max-steps',type=int,default=0)
     p.add_argument('--sequence-length',type=int,default=1024)
@@ -82,6 +84,44 @@ def model_config(args):
 def training_signature(args):
     return {key:getattr(args,key) for key in ('sequence_length','batch_size','grad_accum','lr',
         'min_lr_ratio','warmup_steps','temperature','ce_weight','loss_chunk_tokens','seed','max_hours')}
+
+
+STOP_REASONS = (None, 'max_steps', 'deadline', 'stop_request', 'save_and_exit')
+
+
+def consume_save_and_exit(path):
+    """Only rank zero calls this; leave empty/unknown commands untouched."""
+    try:
+        if path.read_text(encoding='utf-8').strip() != 'save_and_exit':
+            return False
+        path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def training_control(args, step, elapsed, stop_requested, device):
+    """Broadcast the same stop reason and LR to every rank before the next update."""
+    control=torch.zeros(3,device=device,dtype=torch.float64)
+    if dist.get_rank()==0:
+        # An explicit save-and-exit takes priority, including at the deadline.
+        if consume_save_and_exit(args.control_file):
+            reason='save_and_exit'
+            print(f'save_and_exit received from {args.control_file} at step {step}',flush=True)
+        elif args.max_steps and step>=args.max_steps:
+            reason='max_steps'
+        elif elapsed>=args.max_hours*3600:
+            reason='deadline'
+        elif stop_requested or (args.run_dir/'STOP').exists():
+            reason='stop_request'
+        else:
+            reason=None
+        progress=min(elapsed/(args.max_hours*3600),1.)
+        lr=args.lr*min(1.,(step+1)/max(args.warmup_steps,1))*(args.min_lr_ratio+(1-args.min_lr_ratio)*.5*(1+math.cos(math.pi*progress)))
+        control[:]=torch.tensor([elapsed,STOP_REASONS.index(reason),lr],device=device)
+    dist.broadcast(control,src=0)
+    elapsed,reason_code,lr=control.tolist()
+    return elapsed,STOP_REASONS[int(reason_code)],lr
 
 
 def save_checkpoint(model, optimizer, args, step, epoch, batch_in_epoch, elapsed, world, rank):
@@ -205,8 +245,7 @@ def main():
                         'generation':'greedy','prefill_chunk_size':128},
             'objective':'Exact full-vocabulary KL(teacher || student) * T^2 + ce_weight * next-token CE; all nonpadding targets',
             'checkpointing':'non-reentrant decoder-layer and vocabulary-loss checkpoints; grouped LogKV',
-            'time_budget':'wall time from training start including periodic sampling/validation/saving; finalization may add a short tail',
-            'authorization':'User authorized an eight-hour trial and all six GPUs for this run.'})
+            'time_budget':'wall time from training start including periodic sampling/validation/saving; finalization may add a short tail'})
     dist.barrier()
     tokenizer=AutoTokenizer.from_pretrained(SETTINGS.model_path,local_files_only=True)
     teacher,loading=LlamaForCausalLM.from_pretrained(SETTINGS.model_path,local_files_only=True,
@@ -296,18 +335,9 @@ def main():
         record_samples(model,tokenizer,args,step,rank,world,device,phase='initial')
     reason='deadline'
     while True:
-        control=torch.zeros(3,device=device,dtype=torch.float64)
-        if rank==0:
-            elapsed=prior_elapsed+time.monotonic()-started
-            stop=elapsed>=args.max_hours*3600 or (args.max_steps and step>=args.max_steps) or stop_requested['value'] or (args.run_dir/'STOP').exists()
-            progress=min(elapsed/(args.max_hours*3600),1.)
-            lr=args.lr*min(1.,(step+1)/max(args.warmup_steps,1))*(args.min_lr_ratio+(1-args.min_lr_ratio)*.5*(1+math.cos(math.pi*progress)))
-            control[:]=torch.tensor([elapsed,float(bool(stop)),lr],device=device)
-        dist.broadcast(control,src=0)
-        elapsed,stop,lr=control.tolist()
-        if stop:
-            reason=('max_steps' if args.max_steps and step>=args.max_steps else
-                    'deadline' if elapsed>=args.max_hours*3600 else 'stop_request')
+        elapsed,reason,lr=training_control(args,step,prior_elapsed+time.monotonic()-started,
+                                          stop_requested['value'],device)
+        if reason is not None:
             break
         for group in optimizer.param_groups:
             group['lr']=lr
@@ -369,14 +399,16 @@ def main():
     if len(set(hashes))!=1:
         raise RuntimeError('Distributed adapter replicas diverged')
     final_path=save_checkpoint(model,optimizer,args,step,epoch,batch_in_epoch,prior_elapsed+time.monotonic()-started,world,rank)
-    values=validate(model,final_val_loader,device)
-    if rank==0:
-        emit(args.run_dir,'validation.jsonl',{'step':step,'phase':'final_all_heldout',**values})
-    record_samples(model,tokenizer,args,step,rank,world,device,phase='final')
+    values=None
+    if reason!='save_and_exit':
+        values=validate(model,final_val_loader,device)
+        if rank==0:
+            emit(args.run_dir,'validation.jsonl',{'step':step,'phase':'final_all_heldout',**values})
+        record_samples(model,tokenizer,args,step,rank,world,device,phase='final')
     if rank==0:
         write_json(args.run_dir/'completed.json',{'step':step,'reason':reason,'elapsed_seconds':prior_elapsed+time.monotonic()-started,
             'completed_at':datetime.now(timezone.utc).isoformat(),'checkpoint':str(final_path),'validation':values,'adapter_hashes_by_rank':hashes})
-        print('Training completed',flush=True)
+        print(f'Training finished: {reason}; checkpoint={final_path}',flush=True)
     dist.destroy_process_group()
 
 

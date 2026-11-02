@@ -45,11 +45,15 @@ if code:
     raise SystemExit(code)
 if a.evaluate_final:
     completed=json.loads((run/'completed.json').read_text())
-    with (a.log_dir/'final-evaluation.log').open('x') as log:
-        code=subprocess.run(['llm-jp-logkv','evaluate-initial','--adapter',completed['checkpoint'],
-                             '--max-new-tokens',str(a.evaluation_max_new_tokens)],env={**env,'CUDA_VISIBLE_DEVICES':a.gpus.split(',')[0]},
-                            stdout=log,stderr=subprocess.STDOUT).returncode
-    record('evaluation-exit.json',{'returncode':code,'ended_at':datetime.now(timezone.utc).isoformat()})
-    if code:
-        raise SystemExit(code)
+    if completed['reason']=='save_and_exit':
+        record('evaluation-skipped.json',{'reason':'save_and_exit','checkpoint':completed['checkpoint']})
+        print('Saved and stopped; final evaluation skipped.',flush=True)
+    else:
+        with (a.log_dir/'final-evaluation.log').open('x') as log:
+            code=subprocess.run(['llm-jp-logkv','evaluate-initial','--adapter',completed['checkpoint'],
+                                 '--max-new-tokens',str(a.evaluation_max_new_tokens)],env={**env,'CUDA_VISIBLE_DEVICES':a.gpus.split(',')[0]},
+                                stdout=log,stderr=subprocess.STDOUT).returncode
+        record('evaluation-exit.json',{'returncode':code,'ended_at':datetime.now(timezone.utc).isoformat()})
+        if code:
+            raise SystemExit(code)
 record('supervisor-completed.json',{'completed_at':datetime.now(timezone.utc).isoformat()})

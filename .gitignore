@@ -13,6 +13,7 @@ wheels/
 .env
 .env.*
 !.env.example
+control.cmd
 
 # Model/data artifacts belong on the RAID volume.
 data/
