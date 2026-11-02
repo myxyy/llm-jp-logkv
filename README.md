@@ -149,19 +149,34 @@ GQA・生成キャッシュ・LoRA の勾配を CPU で確認します。8B モ�
 蒸留後は `infer --adapter CHECKPOINT_DIR` と `evaluate-initial --adapter CHECKPOINT_DIR`
 で評価できます。通常の `infer` は引き続き未蒸留モデルを使用します。
 
-手動で新しく開始する例（2 GPU、global batch=24、時間制限なしで1 epoch）。run名は毎回変えてください。
+手動で新しく開始する例（2 GPU、global batch=24、時間制限なしで1 epoch）。
+新規学習には新しいrun名を付け、再開時は同じ名前を使います。
 
 ```bash
 cd /home/myxy/llm-jp-logkv
-distill_run="manual-$(date +%Y%m%d-%H%M%S)-$$"
+distill_run=my-distillation
 distill_root=/mnt/raid0/llm-jp-logkv
 ./scripts/uv.sh run --locked python scripts/run_distillation.py \
-  --gpus 0,1 --log-dir "$distill_root/logs/$distill_run" --evaluate-final -- \
+  --run-name "$distill_run" --gpus 0,1 --evaluate-final \
   --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
-  --run-dir "$distill_root/experiments/$distill_run" \
   --batch-size 1 --grad-accum 12 \
   --sample-every 200 --save-every 200 --max-checkpoints 2 --validate-every 200
 ```
+
+同じrunの最新checkpointから再開する場合は、元のコマンドに **`--resume latest`** を追加します。
+
+```bash
+./scripts/uv.sh run --locked python scripts/run_distillation.py \
+  --run-name "$distill_run" --resume latest --gpus 0,1 --evaluate-final \
+  --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
+  --batch-size 1 --grad-accum 12
+```
+
+`--run-dir`・`--log-dir` は廃止しました。保存先は `.env` の設定とrun名から自動決定します。
+ログは `logs/RUN/training.log` に追記し、checkpointは `checkpoints/RUN/step-NNNNNNN/` に保存します。
+起動ごとの設定・終了記録・生成例は `experiments/RUN/sessions/ID/`、監督プロセスの記録は
+`logs/RUN/sessions/ID/` に保持します。両方の `latest/` から今回の記録を参照できます。
+旧版のrunも同名で `--resume latest` を指定して再開できます。
 
 `--max-hours` の省略時は時間無制限、`--num-epochs` の既定値は1です。
 複数epochは `--num-epochs 3`、任意の時間上限は `--max-hours 8` のように指定します。
@@ -170,7 +185,7 @@ epoch末尾の勾配蓄積が指定回数に満たなくても、残りのミニ
 学習率は既定ではepochの進捗に応じて減衰し、経過時間には依存しません。
 
 チェックポイントはrunごとに最新2個を保持します。本体LogKVと同じ `--max-checkpoints N`
-（1以上の整数、既定値2）で変更できます。上の例と同様に、起動コマンドの `--` より後へ指定します。
+（1以上の整数、既定値2）で変更できます。オプション区切りの `--` は不要です。
 新しい保存の完了後に古いstepを削除し、通常終了・`save_and_exit`による保存も保持数に含めます。
 再開時に保持数を変更できます。整理対象は現在のrunのみで、再開元の別runには適用しません。
 
@@ -187,9 +202,13 @@ printf 'save_and_exit\n' > control.cmd
 ```
 
 `control.cmd` は受理時に削除され、中断時の終了後評価・生成は省きます。
-複数runでは起動時の `--` より後に `--control-file /絶対パス/control.cmd` を指定し、
+複数runでは起動時に `--control-file /絶対パス/control.cmd` を指定し、
 runごとに別のファイルを使ってください。
-再開は同じGPU台数・訓練設定と新しいrun/log名で `--resume CHECKPOINT_DIR` を追加します。
+再開時もGPU台数・データ・訓練設定は元と同じ値を指定します。
+`--resume latest` は保存完了済みの最大stepを選びます。該当checkpointがなければエラーになります。
+同じrunの二重起動や、`--resume` を付けずに既存runを開始する操作もエラーになります。
+特定のcheckpointは `--resume step-0000200` やパスで指定できます。
+同じrunを過去のstepへ巻き戻す場合は、新しいrun名と元checkpointのパスを指定してください。
 `--num-epochs` は再開前を含めた通算epoch数です。再開時にepoch数・時間上限を変更できます。
 旧版の8時間上限付きcheckpointも、`--max-hours` を省けば時間上限を外して残りを再開できます。
 1 epoch以上を完了済みなら、追加学習には `--num-epochs 2` 等の大きい通算上限を指定してください。

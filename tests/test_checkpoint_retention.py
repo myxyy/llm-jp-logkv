@@ -11,14 +11,14 @@ from llm_jp_logkv import train
 @pytest.mark.parametrize('flags,expected', [([],2), (['--max-checkpoints','1'],1), (['--max-checkpoints','5'],5)])
 def test_checkpoint_retention_cli(monkeypatch, flags, expected):
     monkeypatch.setattr(sys,'argv',['train','--data','unused',
-        '--run-dir',str(train.SETTINGS.paths['EXPERIMENT_DIR']/'retention-cli-test'),*flags])
+        '--run-name','retention-cli-test',*flags])
     assert train.parse_args().max_checkpoints==expected
 
 
 @pytest.mark.parametrize('value', ['0','-1','1.5'])
 def test_invalid_checkpoint_retention_cli(monkeypatch, value):
     monkeypatch.setattr(sys,'argv',['train','--data','unused',
-        '--run-dir',str(train.SETTINGS.paths['EXPERIMENT_DIR']/'retention-cli-test'),
+        '--run-name','retention-cli-test',
         '--max-checkpoints',value])
     with pytest.raises(SystemExit):
         train.parse_args()
@@ -29,7 +29,7 @@ def saver(tmp_path, monkeypatch):
     monkeypatch.setitem(train.SETTINGS.paths,'EXPERIMENT_DIR',tmp_path/'experiments')
     monkeypatch.setitem(train.SETTINGS.paths,'CHECKPOINT_DIR',tmp_path/'checkpoints')
     monkeypatch.setattr(sys,'argv',['train','--data',str(tmp_path/'data'),
-        '--run-dir',str(tmp_path/'experiments'/'run')])
+        '--run-name','run'])
     args=train.parse_args()
     args.run_start_unix=1234.
     args.run_dir.mkdir(parents=True)
@@ -112,6 +112,22 @@ def test_failed_save_never_prunes_previous_checkpoints(saver, monkeypatch, faile
         saver.save(2)
     assert (old/'complete.json').is_file()
     assert not (saver.args.run_dir/'checkpoint-pruning.jsonl').exists()
+    assert train.completed_checkpoints(saver.root)==[old]
+
+
+@pytest.mark.parametrize('partial_marker', [False,True])
+def test_retry_preserves_incomplete_legacy_save_and_publishes_complete_checkpoint(saver, partial_marker):
+    saver.save(1)
+    interrupted=saver.root/'step-0000002'
+    interrupted.mkdir()
+    (interrupted/'adapter.pt').write_text('partial data')
+    if partial_marker:
+        (interrupted/'complete.json').write_text('{')
+    saved=saver.save(2)
+    assert train.completed_checkpoints(saver.root)[-1]==saved
+    archived=list(saver.root.glob('step-0000002.incomplete-*'))
+    assert len(archived)==1
+    assert (archived[0]/'adapter.pt').read_text()=='partial data'
 
 
 def test_pruning_leaves_incomplete_unrecognized_foreign_and_symlink_paths(saver):

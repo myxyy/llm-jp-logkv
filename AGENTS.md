@@ -31,6 +31,9 @@
 
 # Implementation and verification
 
+- Training uses `--run-name` to derive experiment/log/checkpoint paths and
+  `--resume latest` to continue the same run. Keep per-launch records in sessions
+  and append training logs; reject concurrent launches and in-place rewinds.
 - Training defaults to one total epoch with no time limit. Use `--max-hours` only
   for an explicit wall-time budget; `--num-epochs` includes progress before resume.
 - `--max-checkpoints` defaults to 2, matching upstream LogKV. After a successful

@@ -4,6 +4,7 @@ Run through scripts/uv.sh and torchrun. This entry point configures storage
 before importing the HF/torch stack.
 """
 import argparse
+from contextlib import ExitStack
 from datetime import datetime, timezone, timedelta
 from functools import partial
 from importlib.metadata import version
@@ -15,6 +16,7 @@ import signal
 import shutil
 import subprocess
 import time
+from uuid import uuid4
 
 from .settings import load_settings
 SETTINGS = load_settings()
@@ -29,13 +31,15 @@ from transformers import AutoTokenizer, LlamaForCausalLM
 from .distillation import DistillationModel, adapter_state, load_adapter
 from .inference import file_hash, write_json
 from .training_data import TokenCache, collate_tokens
+from .training_runs import (checkpoint_metadata, completed_checkpoints, create_session, exclusive_run,
+                            named_directory, new_session_id, resolve_resume)
 
 
-def parse_args():
+def build_parser():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data',type=Path,required=True)
-    p.add_argument('--run-dir',type=Path,required=True)
-    p.add_argument('--resume',type=Path)
+    p.add_argument('--run-name',required=True,help='Run name used for checkpoints, logs and experiment records')
+    p.add_argument('--resume',help="'latest', a step directory name in this run, or a checkpoint path")
     p.add_argument('--control-file',type=Path,default=Path('control.cmd'),
                    help='Write save_and_exit here to checkpoint and stop at a step boundary')
     p.add_argument('--max-hours',type=float,default=None,
@@ -65,7 +69,12 @@ def parse_args():
     p.add_argument('--sample-max-new-tokens',type=int,default=256)
     p.add_argument('--seed',type=int,default=20261102)
     p.add_argument('--skip-initial-samples',action='store_true')
-    args=p.parse_args()
+    return p
+
+
+def parse_args(argv=None, parser=None):
+    p=parser or build_parser()
+    args=p.parse_args(argv)
     if min(args.sequence_length,args.batch_size,args.grad_accum,args.rank,args.loss_chunk_tokens,args.val_examples_per_rank,args.sample_max_new_tokens) < 1:
         p.error('Lengths, sizes, and intervals must be positive')
     if args.max_hours is not None and (not math.isfinite(args.max_hours) or args.max_hours<=0):
@@ -78,8 +87,12 @@ def parse_args():
         p.error('--max-checkpoints must be >=1')
     if args.chunk_size < 2 or min(args.sample_every,args.save_every,args.validate_every) < 1:
         p.error('Invalid duration, chunk size, or event interval')
-    if not args.run_dir.resolve().is_relative_to(SETTINGS.paths['EXPERIMENT_DIR'].resolve()):
-        p.error('run-dir must be under configured EXPERIMENT_DIR')
+    try:
+        args.run_dir=named_directory(SETTINGS,'EXPERIMENT_DIR',args.run_name)
+        named_directory(SETTINGS,'CHECKPOINT_DIR',args.run_name)
+        named_directory(SETTINGS,'LOG_DIR',args.run_name)
+    except ValueError as exc:
+        p.error(str(exc))
     return args
 
 
@@ -188,23 +201,8 @@ def prune_checkpoints(root, run_dir, keep):
     """Rank zero prunes only complete checkpoints owned by this run, by step."""
     if keep<1:
         raise ValueError('Checkpoint retention must be >=1')
-    completed=[]
-    for path in root.glob('step-*'):
-        number=path.name.removeprefix('step-')
-        if not number.isascii() or not number.isdecimal() or path.is_symlink() or not path.is_dir():
-            continue
-        if not all((path/name).is_file() for name in ('adapter.pt','training_state.pt','config.json','complete.json')):
-            continue
-        try:
-            metadata=json.loads((path/'complete.json').read_text())
-        except (OSError,ValueError):
-            continue
-        if (not isinstance(metadata,dict) or metadata.get('step')!=int(number)
-                or not isinstance(metadata.get('source_run'),str)
-                or Path(metadata['source_run']).resolve()!=run_dir.resolve()):
-            continue
-        completed.append((int(number),path))
-    for step,path in sorted(completed)[:-keep]:
+    for path in completed_checkpoints(root,run_dir)[:-keep]:
+        step=int(path.name.removeprefix('step-'))
         shutil.rmtree(path)
         emit(run_dir,'checkpoint-pruning.jsonl',{'step':step,'path':str(path),
              'max_checkpoints':keep,'deleted_at':datetime.now(timezone.utc).isoformat()})
@@ -219,23 +217,30 @@ def save_checkpoint(model, optimizer, args, step, epoch, batch_in_epoch, elapsed
     path=root/f'step-{step:07d}'
     if rank==0:
         if path.exists():
-            if not (path/'complete.json').is_file():
-                raise RuntimeError(f'Incomplete existing checkpoint: {path}')
+            if checkpoint_metadata(path) is None:
+                # Preserve an interrupted legacy save under a name excluded from
+                # latest/retention, allowing the same step to be saved again.
+                if path.is_symlink() or not path.is_dir():
+                    raise RuntimeError(f'Unexpected checkpoint path: {path}')
+                path.rename(root/f'{path.name}.incomplete-{uuid4().hex[:12]}')
+        if path.exists():
             complete=json.loads((path/'complete.json').read_text())
             if complete['step']!=step or Path(complete['source_run']).resolve()!=args.run_dir.resolve():
                 raise RuntimeError(f'Existing checkpoint belongs to another run or step: {path}')
         else:
-            path.mkdir(parents=True,exist_ok=False)
-            torch.save(adapter_state(model.student),path/'adapter.pt')
+            temporary=root/f'.{path.name}-{uuid4().hex[:12]}.tmp'
+            temporary.mkdir(parents=True,exist_ok=False)
+            torch.save(adapter_state(model.student),temporary/'adapter.pt')
             torch.save({'optimizer':optimizer.state_dict(),'step':step,'epoch':epoch,
                         'batch_in_epoch':batch_in_epoch,'elapsed_seconds':elapsed,
                         'rngs':rngs,'world_size':world,'training_signature':training_signature(args),
-                        'run_start_unix':args.run_start_unix},path/'training_state.pt')
-            write_json(path/'config.json',model_config(args))
-            write_json(path/'complete.json',{'step':step,'elapsed_seconds':elapsed,
-                       'adapter_sha256':file_hash(path/'adapter.pt'),
-                       'training_state_sha256':file_hash(path/'training_state.pt'),
+                        'run_start_unix':args.run_start_unix},temporary/'training_state.pt')
+            write_json(temporary/'config.json',model_config(args))
+            write_json(temporary/'complete.json',{'step':step,'elapsed_seconds':elapsed,
+                       'adapter_sha256':file_hash(temporary/'adapter.pt'),
+                       'training_state_sha256':file_hash(temporary/'training_state.pt'),
                        'source_run':str(args.run_dir),'data_manifest_sha256':file_hash(args.data/'manifest.json')})
+            temporary.rename(path)
         emit(args.run_dir,'checkpoints.jsonl',{'step':step,'path':str(path),'elapsed_seconds':elapsed})
         print(f'checkpoint step={step} path={path}',flush=True)
         # Never prune before all checkpoint files and the completion marker are saved.
@@ -286,7 +291,7 @@ def record_samples(model, tokenizer, args, step, rank, world, device, phase='per
     collected=[None]*world if rank==0 else None
     dist.gather_object(results,collected,dst=0)
     if rank==0:
-        path=args.run_dir/'samples'/f'{phase}-step-{step:07d}.json'
+        path=args.session_dir/'samples'/f'{phase}-step-{step:07d}.json'
         with path.open('x',encoding='utf-8') as output:
             json.dump({'step':step,'phase':phase,'created_at':datetime.now(timezone.utc).isoformat(),
                        'samples':[r for group in collected for r in group]},output,indent=2,ensure_ascii=False)
@@ -302,6 +307,30 @@ def main():
     device=torch.device('cuda',local_rank)
     torch.cuda.set_device(device)
     dist.init_process_group('nccl',timeout=timedelta(minutes=30),device_id=device)
+    try:
+        with ExitStack() as stack:
+            launch=[None]
+            if rank==0:
+                try:
+                    stack.enter_context(exclusive_run(args.run_dir,os.environ.get('LLM_JP_LOGKV_RUN_TOKEN')))
+                    resume=resolve_resume(args,SETTINGS)
+                    session_id=os.environ.get('LLM_JP_LOGKV_SESSION_ID') or new_session_id()
+                    create_session(args.run_dir,session_id)
+                    launch[0]={'resume':str(resume) if resume else None,'session_id':session_id}
+                except (OSError,ValueError,RuntimeError) as exc:
+                    launch[0]={'error':str(exc)}
+            dist.broadcast_object_list(launch,src=0)
+            if 'error' in launch[0]:
+                raise RuntimeError(launch[0]['error'])
+            args.resume=Path(launch[0]['resume']) if launch[0]['resume'] else None
+            args.session_id=launch[0]['session_id']
+            args.session_dir=args.run_dir/'sessions'/args.session_id
+            run_training(args,device,rank,world)
+    finally:
+        dist.destroy_process_group()
+
+
+def run_training(args, device, rank, world):
     torch.set_num_threads(int(os.environ.get('OMP_NUM_THREADS','2')))
     torch.backends.cuda.matmul.allow_tf32=True
     torch.manual_seed(args.seed)
@@ -310,8 +339,7 @@ def main():
         stop_requested['value']=True
     signal.signal(signal.SIGTERM,request_stop); signal.signal(signal.SIGINT,request_stop)
     if rank==0:
-        args.run_dir.mkdir(parents=True,exist_ok=False)
-        (args.run_dir/'samples').mkdir()
+        (args.session_dir/'samples').mkdir()
         data_manifest=json.loads((args.data/'manifest.json').read_text())
         if data_manifest['tokenizer_revision']!=SETTINGS.model_revision:
             raise ValueError('Token cache was built for a different base revision')
@@ -319,7 +347,7 @@ def main():
             if file_hash(args.data/name)!=digest:
                 raise ValueError(f'Token cache checksum mismatch: {name}')
         root=Path.cwd()
-        write_json(args.run_dir/'manifest.json',{
+        write_json(args.session_dir/'manifest.json',{
             'created_at':datetime.now(timezone.utc).isoformat(),
             'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
             'source_dirty':bool(subprocess.check_output(['git','status','--porcelain'],text=True).strip()),
@@ -375,7 +403,7 @@ def main():
         torch.set_rng_state(saved['rngs'][rank]['cpu'])
         torch.cuda.set_rng_state(saved['rngs'][rank]['cuda'],device)
         del saved
-    ddp=DDP(model,device_ids=[local_rank],broadcast_buffers=False,find_unused_parameters=False,
+    ddp=DDP(model,device_ids=[device.index],broadcast_buffers=False,find_unused_parameters=False,
             gradient_as_bucket_view=True)
     train_data=TokenCache(args.data,'train',args.sequence_length)
     valid_data=TokenCache(args.data,'valid',args.sequence_length)
@@ -394,7 +422,7 @@ def main():
     final_val_loader=DataLoader(Subset(valid_data,val_indices),batch_size=args.batch_size,
                                collate_fn=collate,pin_memory=True)
     if rank==0:
-        write_json(args.run_dir/'runtime.json',{'teacher_parameters':sum(p.numel() for p in teacher.parameters()),
+        write_json(args.session_dir/'runtime.json',{'teacher_parameters':sum(p.numel() for p in teacher.parameters()),
             'trainable_parameters':sum(p.numel() for p in params),'layers':len(model.student.layers),
             'train_examples':len(train_data),'valid_examples':len(valid_data),
             'global_examples_per_step':world*args.batch_size*args.grad_accum,
@@ -409,7 +437,7 @@ def main():
         prior_elapsed=time.time()-args.run_start_unix
     if rank==0:
         remaining_seconds=None if args.max_hours is None else max(0,args.max_hours*3600-prior_elapsed)
-        write_json(args.run_dir/'started.json',{'started_at':datetime.now(timezone.utc).isoformat(),
+        write_json(args.session_dir/'started.json',{'started_at':datetime.now(timezone.utc).isoformat(),
             'pid':os.getpid(),'remaining_seconds':remaining_seconds,'step':step,
             'num_epochs':args.num_epochs,'epoch':cursor.epoch,'batch_in_epoch':cursor.batch_in_epoch})
         print(f'Training limits: epochs={args.num_epochs or "unlimited"}, '
@@ -498,11 +526,10 @@ def main():
             emit(args.run_dir,'validation.jsonl',{'step':step,'phase':'final_all_heldout',**values})
         record_samples(model,tokenizer,args,step,rank,world,device,phase='final')
     if rank==0:
-        write_json(args.run_dir/'completed.json',{'step':step,'reason':reason,'elapsed_seconds':prior_elapsed+time.monotonic()-started,
+        write_json(args.session_dir/'completed.json',{'step':step,'reason':reason,'elapsed_seconds':prior_elapsed+time.monotonic()-started,
             'epoch':cursor.epoch,'batch_in_epoch':cursor.batch_in_epoch,
             'completed_at':datetime.now(timezone.utc).isoformat(),'checkpoint':str(final_path),'validation':values,'adapter_hashes_by_rank':hashes})
         print(f'Training finished: {reason}; checkpoint={final_path}',flush=True)
-    dist.destroy_process_group()
 
 
 if __name__=='__main__':

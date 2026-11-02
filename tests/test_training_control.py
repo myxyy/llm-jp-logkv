@@ -90,7 +90,7 @@ def test_save_and_exit_broadcast_to_all_ranks(tmp_path):
 @pytest.mark.parametrize('custom', [False, True])
 def test_control_file_cli_default_and_override(tmp_path, monkeypatch, custom):
     argv=['train','--data',str(tmp_path/'data'),
-          '--run-dir',str(train.SETTINGS.paths['EXPERIMENT_DIR']/'control-cli-test')]
+          '--run-name','control-cli-test']
     if custom:
         argv+=['--control-file',str(tmp_path/'custom.cmd')]
     monkeypatch.setattr(sys,'argv',argv)
@@ -106,7 +106,7 @@ def test_control_file_cli_default_and_override(tmp_path, monkeypatch, custom):
 ])
 def test_explicit_limits_and_unlimited_time_default(monkeypatch, flags, expected):
     monkeypatch.setattr(sys,'argv',['train','--data','unused',
-        '--run-dir',str(train.SETTINGS.paths['EXPERIMENT_DIR']/'epoch-cli-test'),*flags])
+        '--run-name','epoch-cli-test',*flags])
     args=train.parse_args()
     assert (args.max_hours,args.num_epochs,args.max_steps)==expected
 
@@ -117,7 +117,7 @@ def test_explicit_limits_and_unlimited_time_default(monkeypatch, flags, expected
 ])
 def test_invalid_limits_rejected(monkeypatch, flags):
     monkeypatch.setattr(sys,'argv',['train','--data','unused',
-        '--run-dir',str(train.SETTINGS.paths['EXPERIMENT_DIR']/'epoch-cli-test'),*flags])
+        '--run-name','epoch-cli-test',*flags])
     with pytest.raises(SystemExit):
         train.parse_args()
 
@@ -174,7 +174,7 @@ def test_legacy_cursor_at_epoch_end_is_normalized():
 
 def test_legacy_resume_can_remove_time_limit_but_not_change_data_order(monkeypatch):
     monkeypatch.setattr(sys,'argv',['train','--data','unused',
-        '--run-dir',str(train.SETTINGS.paths['EXPERIMENT_DIR']/'epoch-cli-test')])
+        '--run-name','epoch-cli-test'])
     args=train.parse_args()
     old_signature={**train.training_signature(args),'max_hours':8.}
     train.check_resume_signature(old_signature,args)

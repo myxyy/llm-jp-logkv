@@ -84,16 +84,15 @@ HF_HUB_DISABLE_XET=1 ./scripts/uv.sh run --locked python scripts/prepare_distill
 時間やstepの上限も指定した場合は、最初に達した条件で保存して終了する。
 以下のコマンドは既定の手動起動とは別に、前回の8時間試行の条件を明示したもの。
 
-既存成果物を上書きしないため、run-dirとlog-dirは新しい名前にする。
+新規学習には新しい `--run-name` を使う。再開は同じrun名に `--resume latest` を追加する。
+`--run-dir`・`--log-dir` は廃止し、設定済みの保存先ルートとrun名から自動決定する。
 これは今回承認された6 GPUのコマンドであり、将来の長時間実験の包括承認ではない。
 
 ```bash
 ./scripts/uv.sh run --locked python scripts/run_distillation.py \
   --gpus 0,1,2,3,4,5 \
-  --log-dir /mnt/raid0/llm-jp-logkv/logs/NEW-RUN \
-  --evaluate-final -- \
+  --run-name NEW-RUN --evaluate-final \
   --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-20261101T155341Z-4326ce39 \
-  --run-dir /mnt/raid0/llm-jp-logkv/experiments/NEW-RUN \
   --num-epochs 0 --max-hours 8 --sequence-length 1024 --batch-size 1 --grad-accum 4 \
   --rank 32 --alpha 64 --chunk-size 4 --loss-chunk-tokens 512 \
   --temperature 1 --ce-weight 0.1 --lr 1e-4 --warmup-steps 50 \
@@ -103,7 +102,7 @@ HF_HUB_DISABLE_XET=1 ./scripts/uv.sh run --locked python scripts/prepare_distill
 
 supervisorはtorchrunの終了コードを保存し、成功時には最終adapterと元モデルの
 比較をGPU 0で行う。切断後も実行する場合はsupervisorを別sessionで起動する。
-`process.json` にPIDとLinuxのprocess start ticksを記録する。
+`${LOG_DIR}/RUN/latest/process.json` にPIDとLinuxのprocess start ticksを記録する。
 監視呼び出しのtimeoutだけで再起動せず、PIDの一致とmetricsの更新を確認する。
 
 checkpointは `${CHECKPOINT_DIR}/RUN/step-NNNNNNN/` に保存する。
@@ -111,16 +110,38 @@ checkpointは `${CHECKPOINT_DIR}/RUN/step-NNNNNNN/` に保存する。
 チェックサム入り `complete.json` が揃ったものだけを使用する。
 
 保持数は本体LogKVと同じ **`--max-checkpoints N`（既定値2、1以上の整数）**で指定する。
-`scripts/run_distillation.py` の `--` より後に渡す。現在のrunの保存完了済みcheckpointを
+起動コマンドに渡す（オプション区切りの `--` は不要）。現在のrunの保存完了済みcheckpointを
 step番号順で最新N個だけ残す。新規保存完了後にrank 0が古いものを削除するため、
 保存中は一時的にN＋1個分の容量が必要になる。保存失敗時には古いcheckpointを削除しない。
 定期保存・通常終了・`save_and_exit`の保存すべてに適用し、同じstepの二重保存は1個と数える。
 削除履歴はrun-dirの `checkpoint-pruning.jsonl` とtraining.logに残す。
 未完了・不明なディレクトリ、別runのcheckpointは整理対象外。
-再開時に保持数を変更できるが、再開元runのcheckpointはそのまま残る。
+再開時に保持数を変更でき、同じrunでは再開前のcheckpointも保持数に含める。
+別runからパス指定で再開した場合、再開元の別runは整理対象外となる。
 後述する8時間試行で16個すべてを保存したのは、この保持数制限の追加前の挙動である。
 
-再開は同じ並列数・訓練設定と新しいrun/log-dirに `--resume CHECKPOINT` を指定する。
+再開は同じ並列数・データ・訓練設定・run名に `--resume latest` を指定する。
+最新とは保存完了済みの最大stepで、未完了・一時ディレクトリは対象外。
+該当checkpointがない場合はエラーにし、新規学習へ切り替えない。
+`--resume step-0000200` やcheckpointのパスも指定できる。
+既存runで再開できるのはそのrunの最新checkpointのみ。古いstepから分岐する場合は
+新しいrun名と元checkpointのパスを指定する。同じrunの二重起動はロックで拒否する。
+
+`${LOG_DIR}/RUN/training.log` と `${EXPERIMENT_DIR}/RUN/` のmetrics・validation等のJSONLは追記する。
+各起動のmanifest・runtime・started・completedとsamplesは
+`${EXPERIMENT_DIR}/RUN/sessions/ID/`、supervisorの終了記録と比較評価ログは
+`${LOG_DIR}/RUN/sessions/ID/` に分け、両方の `latest/` シンボリックリンクから最新起動を参照できる。
+再開や同stepでの即時終了でも過去のサンプル・終了記録と衝突しない。
+旧版のrun直下にある記録は保持し、新版の再開後の記録は `latest/` で確認する。
+従来の `checkpoints/RUN/step-NNNNNNN` も移動せず同じrun名で再開可能。
+新規checkpointは一時ディレクトリに保存し、保存完了後に公開する。
+再保存先に旧版の未完了ディレクトリが残っている場合は `.incomplete-…` を付けて退避する。
+
+run名対応はCPU 270 testsと実重み2 GPUの3回起動で検証した。
+同じrunでstep 1の保存中断からlatestでstep 4へ再開し、さらに同stepでの再開も成功した。
+step 3/4の2 checkpointだけを保持し、ログ追記・起動記録の保持・終了後評価を確認した。
+記録は `logs/named-run-smoke-20261102T120616Z-6af80b-validation.json`（RAID配下）。
+
 epoch数・時間・stepの上限は再開時に変更できる。旧checkpointに記録された `max_hours=8` は
 訓練設定の互換性検査から分離したため、`--max-hours` を省いて時間上限を外せる。
 モデル・データ・batch size・勾配蓄積数・optimizer/LR係数などの整合性検査は維持する。
@@ -137,7 +158,7 @@ epoch数・時間・stepの上限は再開時に変更できる。旧checkpoint�
 epoch末尾は残りのミニバッチ数で最後の勾配蓄積・DDP同期を行い、次のepochへ食い込まない。
 再開時は保存されたデータ位置から残りを処理する。DDP samplerとDataLoaderの `drop_last`
 設定は従来どおりで、GPU台数・batch sizeで割り切れないデータ末尾は各epochの対象外となる。
-起動ログと `started.json` に時間・epoch上限を、metricsにepoch・データ位置・実際の蓄積回数を記録する。
+起動ログと `latest/started.json` に時間・epoch上限を、metricsにepoch・データ位置・実際の蓄積回数を記録する。
 
 この既定値変更はCPU 233 testsで検証した。実重み2 GPU・短い10会話の検証では、
 4＋1回の勾配蓄積で1,231有効tokensを重複なく1周し、`reason="num_epochs"` で終了した。
@@ -157,11 +178,11 @@ printf 'save_and_exit\n' > control.cmd
 rank 0だけがコマンドを読み、全rankへ同じ終了理由をbroadcastする。
 実行中のoptimizer step・検証・サンプル生成が終わったstep境界で、adapter、optimizer、
 各rankのRNG、epoch内のデータ位置を保存して終了コード0で停止する。
-受理したファイルは削除し、`completed.json` に `reason="save_and_exit"` とcheckpointパスを記録する。
+受理したファイルは削除し、`latest/completed.json` に `reason="save_and_exit"` とcheckpointパスを記録する。
 この場合の終了後全件検証と生成は省き、`validation` はnullになる。
-supervisorに `--evaluate-final` があっても比較評価を省き、`evaluation-skipped.json` を記録する。
+supervisorに `--evaluate-final` があっても比較評価を省き、ログ側の `latest/evaluation-skipped.json` を記録する。
 
-起動コマンドの `--` より後に `--control-file PATH` を追加すると監視先を変更できる。
+起動コマンドに `--control-file PATH` を追加すると監視先を変更できる。
 複数runは同じ制御ファイルを共有せず、たとえばrunごとの絶対パスを指定する。
 空・未認識の内容では停止せず、ファイルも削除しない。対応コマンドは `save_and_exit`。
 既存のrun-dir内 `STOP` による停止は引き続き使え、従来どおり終了時の検証・生成を実施する。
