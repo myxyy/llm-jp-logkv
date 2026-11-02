@@ -43,11 +43,61 @@ DDPの平均化と勾配蓄積に合わせて、全rankの有効トークン数�
 
 ## データ
 
+### 拡充版（2026-11-03）
+
+使用する3サブセットとデータrevisionは初回試行と同じ。
+`reasoning_low`・`reasoning_medium`・`reasoning_high` をすべて読み、
+**各サブセットの3 splitを合わせて100,000件、合計300,000件**を候補として抽出する。
+各splitに固定件数を割り当てず、元レコード全体から一様なreservoir samplingを行う。
+seedは従来どおり20261102。各レコードとmanifestに元splitを記録する。
+
+最初の完結応答、64〜2,049 tokens、途中切り詰めなし、tool等の未対応形式除外、
+本文hashによる重複除去・約1%の検証分割は維持する。
+元データのsystem metadataにあるreasoning effortを保持し、未指定時は元splitの値を使う。
+訓練時にも従来どおり `--sequence-length + 1` tokens以内の会話だけを使用するため、
+長いmedium/highの応答は除外される場合がある。候補300,000件はフィルタ前の件数である。
+
+拡充版の保存先:
+
+```text
+/mnt/raid0/llm-jp-logkv/datasets/distill-cache-all-reasoning-20261103-100k
+```
+
+作成結果は**訓練227,698件・検証2,243件、193,300,426 tokens**。
+系列長1,024で使用できるのは**訓練161,240件・検証1,618件**である。
+
+| 元split | 抽出候補 | キャッシュ採用（訓練＋検証） | 系列長1,024の訓練 | 系列長1,024の検証 |
+|---|---:|---:|---:|---:|
+| reasoning_low | 90,214 | 78,689 | 63,325 | 639 |
+| reasoning_medium | 102,191 | 82,566 | 63,813 | 647 |
+| reasoning_high | 107,595 | 68,686 | 34,102 | 332 |
+| 合計 | 300,000 | 229,941 | 161,240 | 1,618 |
+
+6 GPU・batch size 1・grad accum 4・系列長1,024では1 epochは6,719 optimizer steps。
+従来のDistributedSamplerの `drop_last` により、GPU台数で割り切れない末尾2件はそのepochでは使わない。
+23元shardのSHA-256、キャッシュ全ファイルのhash、uint32・offset・会話長・重複・訓練/検証分割と、
+3サブセット×3 splitのreasoning header・analysis/final形式を確認済み。
+旧キャッシュのhashも不変。検証記録は `logs/expanded-sft-validation-20261103.json`（RAID配下）。
+
+再作成は新しい出力先を指定する。以下のsplit・抽出件数・長さは現在の既定値でもある。
+
+```bash
+HF_HUB_DISABLE_XET=1 ./scripts/uv.sh run --locked python scripts/prepare_distillation_data.py \
+  --download --output /mnt/raid0/llm-jp-logkv/datasets/NEW-ALL-REASONING-CACHE \
+  --splits reasoning_low reasoning_medium reasoning_high \
+  --candidates-per-subset 100000 --max-length 2049
+```
+
+拡充版は新しいrunで開始する。既存checkpointの `--resume` はデータmanifestの一致を検査するため、
+旧runを再開するときは元のキャッシュを使う。
+
+### 初回試行のキャッシュ（reasoning_lowのみ）
+
 公開SFTデータ `llm-jp/llm-jp-4.1-thinking-sft-data` のrevision
 `cb4210190af6a0000fd91cb5bb8361ad6d6ade01` を固定した。
 `llmjp_magpie_sft_v1.0`、`logical_math_coding_wizard8x22b`、
 `llmjp_extraction_wiki_ja_v0.3` の reasoning_low shardsから、各30,000件を
-seed=20261102でreservoir samplingする。
+seed=20261102でreservoir samplingした。
 
 最初の完結したuser/assistant応答を使い、analysisは元templateのthinking、
 finalはcontentに分ける。元データのsystem metadataも保持する。
@@ -77,7 +127,8 @@ offsetの整合性、会話hashの一意性、学習・検証indexの非重複�
 
 ```bash
 HF_HUB_DISABLE_XET=1 ./scripts/uv.sh run --locked python scripts/prepare_distillation_data.py \
-  --download --output /mnt/raid0/llm-jp-logkv/datasets/NEW-CACHE
+  --download --output /mnt/raid0/llm-jp-logkv/datasets/NEW-LOW-ONLY-CACHE \
+  --splits reasoning_low --candidates-per-subset 30000 --max-length 2049
 ```
 
 ## 実行と再開
@@ -102,7 +153,7 @@ distill_run=my-distillation
 distill_root=/mnt/raid0/llm-jp-logkv
 ./scripts/uv.sh run --locked python scripts/run_distillation.py \
   --run-name "$distill_run" --gpus 0,1 --evaluate-final \
-  --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
+  --data "$distill_root/datasets/distill-cache-all-reasoning-20261103-100k" \
   --num-epochs 1 --batch-size 1 --grad-accum 12 \
   --sample-every 200 --save-every 200 --max-checkpoints 2 --validate-every 200
 ```
@@ -118,7 +169,7 @@ distill_run=my-distillation
 distill_root=/mnt/raid0/llm-jp-logkv
 ./scripts/uv.sh run --locked python scripts/run_distillation.py \
   --run-name "$distill_run" --resume latest --gpus 0,1 --evaluate-final \
-  --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
+  --data "$distill_root/datasets/distill-cache-all-reasoning-20261103-100k" \
   --num-epochs 1 --batch-size 1 --grad-accum 12 \
   --sample-every 200 --save-every 200 --max-checkpoints 2 --validate-every 200
 ```

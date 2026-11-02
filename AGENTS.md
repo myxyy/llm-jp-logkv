@@ -31,6 +31,9 @@
 
 # Implementation and verification
 
+- Data preparation defaults to all three reasoning splits and 100,000 candidates
+  per subset across those splits. Keep first-exchange/length/dedup/split filters;
+  use a new cache directory and retain split provenance in records/manifests.
 - Training uses `--run-name` to derive experiment/log/checkpoint paths and
   `--resume latest` to continue the same run. Keep per-launch records in sessions
   and append training logs; reject concurrent launches and in-place rewinds.

@@ -151,6 +151,10 @@ GQA・生成キャッシュ・LoRA の勾配を CPU で確認します。8B モ�
 
 手動で新しく開始する例（2 GPU、global batch=24、時間制限なしで1 epoch）。
 新規学習には新しいrun名を付け、再開時は同じ名前を使います。
+以下は3サブセットのlow/medium/highから各サブセット合計10万件を候補抽出した拡充版です。
+キャッシュは訓練227,698件・検証2,243件で、既定の系列長1,024では訓練161,240件・検証1,618件を使います。
+フィルタ条件・作成コマンドは[データの説明](doc/distillation-20261102.md#データ)を参照してください。
+旧runの再開には、そのrunで使用した旧キャッシュを指定します。
 
 ```bash
 cd /home/myxy/llm-jp-logkv
@@ -158,7 +162,7 @@ distill_run=my-distillation
 distill_root=/mnt/raid0/llm-jp-logkv
 ./scripts/uv.sh run --locked python scripts/run_distillation.py \
   --run-name "$distill_run" --gpus 0,1 --evaluate-final \
-  --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
+  --data "$distill_root/datasets/distill-cache-all-reasoning-20261103-100k" \
   --batch-size 1 --grad-accum 12 \
   --sample-every 200 --save-every 200 --max-checkpoints 2 --validate-every 200
 ```
@@ -168,7 +172,7 @@ distill_root=/mnt/raid0/llm-jp-logkv
 ```bash
 ./scripts/uv.sh run --locked python scripts/run_distillation.py \
   --run-name "$distill_run" --resume latest --gpus 0,1 --evaluate-final \
-  --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
+  --data "$distill_root/datasets/distill-cache-all-reasoning-20261103-100k" \
   --batch-size 1 --grad-accum 12
 ```
 
