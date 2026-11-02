@@ -31,6 +31,8 @@
 
 # Implementation and verification
 
+- Training defaults to one total epoch with no time limit. Use `--max-hours` only
+  for an explicit wall-time budget; `--num-epochs` includes progress before resume.
 - Keep the imported LogKV core traceable to `UPSTREAM.json`; record any subsequent
   semantic changes. Build Llama-specific adapters separately from the reference core.
 - Preserve original Llama tokenizer, chat template, RMSNorm semantics, and FFN when

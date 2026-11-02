@@ -79,6 +79,11 @@ HF_HUB_DISABLE_XET=1 ./scripts/uv.sh run --locked python scripts/prepare_distill
 
 ## 実行と再開
 
+現在の既定値は **時間制限なし・1 epoch**。`--max-hours` の省略は無制限、
+`--num-epochs` の省略は1となる。`--num-epochs N` は再開前からの通算周回数を表す。
+時間やstepの上限も指定した場合は、最初に達した条件で保存して終了する。
+以下のコマンドは既定の手動起動とは別に、前回の8時間試行の条件を明示したもの。
+
 既存成果物を上書きしないため、run-dirとlog-dirは新しい名前にする。
 これは今回承認された6 GPUのコマンドであり、将来の長時間実験の包括承認ではない。
 
@@ -89,7 +94,7 @@ HF_HUB_DISABLE_XET=1 ./scripts/uv.sh run --locked python scripts/prepare_distill
   --evaluate-final -- \
   --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-20261101T155341Z-4326ce39 \
   --run-dir /mnt/raid0/llm-jp-logkv/experiments/NEW-RUN \
-  --max-hours 8 --sequence-length 1024 --batch-size 1 --grad-accum 4 \
+  --num-epochs 0 --max-hours 8 --sequence-length 1024 --batch-size 1 --grad-accum 4 \
   --rank 32 --alpha 64 --chunk-size 4 --loss-chunk-tokens 512 \
   --temperature 1 --ce-weight 0.1 --lr 1e-4 --warmup-steps 50 \
   --sample-every 200 --save-every 200 --validate-every 200 \
@@ -105,8 +110,29 @@ checkpointは `${CHECKPOINT_DIR}/RUN/step-NNNNNNN/` に保存する。
 `adapter.pt`、optimizer/RNG/data cursor入り `training_state.pt`、設定、
 チェックサム入り `complete.json` が揃ったものだけを使用する。
 再開は同じ並列数・訓練設定と新しいrun/log-dirに `--resume CHECKPOINT` を指定する。
-`--max-hours` も再開前と同じ値を使う。停止中の時間を含めた元のwall time上限を保持するため、
-上限を過ぎたcheckpointをそのまま再開しても学習時間は増えない。
+epoch数・時間・stepの上限は再開時に変更できる。旧checkpointに記録された `max_hours=8` は
+訓練設定の互換性検査から分離したため、`--max-hours` を省いて時間上限を外せる。
+モデル・データ・batch size・勾配蓄積数・optimizer/LR係数などの整合性検査は維持する。
+`--num-epochs` は通算なので、既に1 epoch以上を完了したcheckpointから追加学習するには
+2以上など、現在の進捗より大きい上限を指定する。
+`--max-hours` を明示した場合だけ、停止時間を含めた元の開始時刻から上限を計算する。
+
+学習率は有限のepoch上限がある場合はepoch進捗によるcosine decayを使う。
+`--num-epochs 0` では明示された時間上限、時間上限がなければstep上限を使う。
+時間・step上限の両方がない `--num-epochs 0` はエラーにする。
+再開時に期間の設定を変えた場合は、新しい期間に合わせた学習率となる。
+旧8時間試行のsourceは `ee47991` であり、この既定値・epoch境界処理の変更前の結果である。
+
+epoch末尾は残りのミニバッチ数で最後の勾配蓄積・DDP同期を行い、次のepochへ食い込まない。
+再開時は保存されたデータ位置から残りを処理する。DDP samplerとDataLoaderの `drop_last`
+設定は従来どおりで、GPU台数・batch sizeで割り切れないデータ末尾は各epochの対象外となる。
+起動ログと `started.json` に時間・epoch上限を、metricsにepoch・データ位置・実際の蓄積回数を記録する。
+
+この既定値変更はCPU 233 testsで検証した。実重み2 GPU・短い10会話の検証では、
+4＋1回の勾配蓄積で1,231有効tokensを重複なく1周し、`reason="num_epochs"` で終了した。
+保存・中断から残りだけ再開した最終重みも連続実行と完全一致した。
+旧版の期限切れcheckpointから時間制限を外す再開も確認済み。
+記録は `logs/epoch-default-20261102T104125Z-validation.json`（RAID配下）。
 
 ### control.cmdによる保存・中断（試行完了後に追加）
 

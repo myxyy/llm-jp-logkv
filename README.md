@@ -149,7 +149,7 @@ GQA・生成キャッシュ・LoRA の勾配を CPU で確認します。8B モ�
 蒸留後は `infer --adapter CHECKPOINT_DIR` と `evaluate-initial --adapter CHECKPOINT_DIR`
 で評価できます。通常の `infer` は引き続き未蒸留モデルを使用します。
 
-手動で新しく開始する例（2 GPU、global batch=24）。run名は毎回変えてください。
+手動で新しく開始する例（2 GPU、global batch=24、時間制限なしで1 epoch）。run名は毎回変えてください。
 
 ```bash
 cd /home/myxy/llm-jp-logkv
@@ -159,11 +159,18 @@ distill_root=/mnt/raid0/llm-jp-logkv
   --gpus 0,1 --log-dir "$distill_root/logs/$distill_run" --evaluate-final -- \
   --data "$distill_root/datasets/distill-cache-20261101T155341Z-4326ce39" \
   --run-dir "$distill_root/experiments/$distill_run" \
-  --max-hours 8 --batch-size 1 --grad-accum 12 \
+  --batch-size 1 --grad-accum 12 \
   --sample-every 200 --save-every 200 --validate-every 200
 ```
 
-前回と同じ6 GPUの条件にする場合は `--gpus 0,1,2,3,4,5 --grad-accum 4`。
+`--max-hours` の省略時は時間無制限、`--num-epochs` の既定値は1です。
+複数epochは `--num-epochs 3`、任意の時間上限は `--max-hours 8` のように指定します。
+epoch数・時間・step数を複数指定した場合は、最初に達した上限で保存して終了します。
+epoch末尾の勾配蓄積が指定回数に満たなくても、残りのミニバッチを更新してから終了します。
+学習率は既定ではepochの進捗に応じて減衰し、経過時間には依存しません。
+
+6 GPUにする場合は `--gpus 0,1,2,3,4,5 --grad-accum 4`。
+前回のようにepoch数を制限せず8時間で区切る場合は、さらに `--num-epochs 0 --max-hours 8` を指定します。
 ログは `logs/$distill_run/training.log` に出ます。切断後も動かす場合はtmux等から起動します。
 
 別ターミナルから以下を書き込むと、現在の処理が終わったstep境界で全rankが同期し、
@@ -178,7 +185,10 @@ printf 'save_and_exit\n' > control.cmd
 複数runでは起動時の `--` より後に `--control-file /絶対パス/control.cmd` を指定し、
 runごとに別のファイルを使ってください。
 再開は同じGPU台数・訓練設定と新しいrun/log名で `--resume CHECKPOINT_DIR` を追加します。
-時間上限は元の開始時刻から計算し、停止中の時間も含みます。
+`--num-epochs` は再開前を含めた通算epoch数です。再開時にepoch数・時間上限を変更できます。
+旧版の8時間上限付きcheckpointも、`--max-hours` を省けば時間上限を外して残りを再開できます。
+1 epoch以上を完了済みなら、追加学習には `--num-epochs 2` 等の大きい通算上限を指定してください。
+`--max-hours` を明示した場合は、元の開始時刻から停止中の時間も含めて計算します。
 保存先・再開条件の詳細は[停止・再開手順](doc/distillation-20261102.md#実行と再開)を参照してください。
 
 ## 配置と次の作業
@@ -190,7 +200,7 @@ runごとに別のファイルを使ってください。
 - `tests/logkv/`: 移植元由来の回帰テスト
 - `src/llm_jp_logkv/llama_attention.py`: 投影流用・RoPE後のdense/LogKV独立API
 - `src/llm_jp_logkv/distillation.py`: 教師から独立したLoRAと全語彙KL/CE
-- `src/llm_jp_logkv/train.py`: 時間制限付きDDP訓練、定期記録、checkpoint再開
+- `src/llm_jp_logkv/train.py`: epoch制御・任意の時間制限付きDDP訓練、定期記録、checkpoint再開
 - `src/llm_jp_logkv/training_data.py`: 完結会話の変換、本文hash分割、uint32キャッシュ
 - [固定減衰LogKVの蒸留](doc/distillation-20261102.md)
 - [実重みの初期評価（蒸留なし）](doc/initial-quality-20261102.md)

@@ -1,4 +1,4 @@
-"""Time-bounded DDP distillation with immutable checkpoints and periodic samples.
+"""Epoch-bounded DDP distillation with optional time limits and immutable checkpoints.
 
 Run through scripts/uv.sh and torchrun. This entry point configures storage
 before importing the HF/torch stack.
@@ -37,8 +37,12 @@ def parse_args():
     p.add_argument('--resume',type=Path)
     p.add_argument('--control-file',type=Path,default=Path('control.cmd'),
                    help='Write save_and_exit here to checkpoint and stop at a step boundary')
-    p.add_argument('--max-hours',type=float,default=8.)
-    p.add_argument('--max-steps',type=int,default=0)
+    p.add_argument('--max-hours',type=float,default=None,
+                   help='Optional wall-time limit in hours; omitted means no time limit')
+    p.add_argument('--num-epochs',type=int,default=1,
+                   help='Total epochs including before resume (default: 1); 0 requires a time or step limit')
+    p.add_argument('--max-steps',type=int,default=0,
+                   help='Optional total optimizer-step limit; 0 disables it')
     p.add_argument('--sequence-length',type=int,default=1024)
     p.add_argument('--batch-size',type=int,default=1)
     p.add_argument('--grad-accum',type=int,default=4)
@@ -61,7 +65,13 @@ def parse_args():
     args=p.parse_args()
     if min(args.sequence_length,args.batch_size,args.grad_accum,args.rank,args.loss_chunk_tokens,args.val_examples_per_rank,args.sample_max_new_tokens) < 1:
         p.error('Lengths, sizes, and intervals must be positive')
-    if args.max_hours <= 0 or args.chunk_size < 2 or min(args.sample_every,args.save_every,args.validate_every) < 1:
+    if args.max_hours is not None and (not math.isfinite(args.max_hours) or args.max_hours<=0):
+        p.error('--max-hours must be finite and positive; omit it for no time limit')
+    if args.num_epochs<0 or args.max_steps<0:
+        p.error('--num-epochs and --max-steps must be nonnegative')
+    if args.num_epochs==0 and args.max_hours is None and args.max_steps==0:
+        p.error('--num-epochs 0 requires --max-hours or --max-steps')
+    if args.chunk_size < 2 or min(args.sample_every,args.save_every,args.validate_every) < 1:
         p.error('Invalid duration, chunk size, or event interval')
     if not args.run_dir.resolve().is_relative_to(SETTINGS.paths['EXPERIMENT_DIR'].resolve()):
         p.error('run-dir must be under configured EXPERIMENT_DIR')
@@ -83,10 +93,47 @@ def model_config(args):
 
 def training_signature(args):
     return {key:getattr(args,key) for key in ('sequence_length','batch_size','grad_accum','lr',
-        'min_lr_ratio','warmup_steps','temperature','ce_weight','loss_chunk_tokens','seed','max_hours')}
+        'min_lr_ratio','warmup_steps','temperature','ce_weight','loss_chunk_tokens','seed')}
 
 
-STOP_REASONS = (None, 'max_steps', 'deadline', 'stop_request', 'save_and_exit')
+def check_resume_signature(saved, args):
+    # Old checkpoints included max_hours. Limits may change on resume; model,
+    # loss, optimizer hyperparameters and data-order settings must still match.
+    saved={key:value for key,value in saved.items() if key not in ('max_hours','num_epochs')}
+    if saved!=training_signature(args):
+        raise ValueError('Resume training/data-order configuration differs')
+
+
+class EpochBatchIterator:
+    """Resume a per-rank data cursor without accumulating across epoch boundaries."""
+    def __init__(self, loader, sampler, epoch=0, batch_in_epoch=0):
+        self.loader,self.sampler=loader,sampler
+        if not len(loader) or epoch<0 or not 0<=batch_in_epoch<=len(loader):
+            raise ValueError('Invalid checkpoint epoch/data cursor')
+        # Legacy checkpoints can point just past the last batch of an epoch.
+        self.epoch=epoch+batch_in_epoch//len(loader)
+        self.batch_in_epoch=batch_in_epoch%len(loader)
+        self.iterator=None
+
+    def next_update(self, grad_accum):
+        if grad_accum<1:
+            raise ValueError('grad_accum must be positive')
+        if self.iterator is None:
+            self.sampler.set_epoch(self.epoch)
+            self.iterator=iter(self.loader)
+            for _ in range(self.batch_in_epoch):
+                next(self.iterator)
+        count=min(grad_accum,len(self.loader)-self.batch_in_epoch)
+        batches=[next(self.iterator) for _ in range(count)]
+        self.batch_in_epoch+=count
+        if self.batch_in_epoch==len(self.loader):
+            self.epoch+=1
+            self.batch_in_epoch=0
+            self.iterator=None
+        return batches
+
+
+STOP_REASONS = (None, 'max_steps', 'deadline', 'stop_request', 'save_and_exit', 'num_epochs')
 
 
 def consume_save_and_exit(path):
@@ -100,7 +147,7 @@ def consume_save_and_exit(path):
     return True
 
 
-def training_control(args, step, elapsed, stop_requested, device):
+def training_control(args, step, elapsed, stop_requested, device, *, epoch, batch_in_epoch, batches_per_epoch):
     """Broadcast the same stop reason and LR to every rank before the next update."""
     control=torch.zeros(3,device=device,dtype=torch.float64)
     if dist.get_rank()==0:
@@ -110,13 +157,21 @@ def training_control(args, step, elapsed, stop_requested, device):
             print(f'save_and_exit received from {args.control_file} at step {step}',flush=True)
         elif args.max_steps and step>=args.max_steps:
             reason='max_steps'
-        elif elapsed>=args.max_hours*3600:
+        elif args.num_epochs and epoch>=args.num_epochs:
+            reason='num_epochs'
+        elif args.max_hours is not None and elapsed>=args.max_hours*3600:
             reason='deadline'
         elif stop_requested or (args.run_dir/'STOP').exists():
             reason='stop_request'
         else:
             reason=None
-        progress=min(elapsed/(args.max_hours*3600),1.)
+        if args.num_epochs:
+            progress=(epoch+batch_in_epoch/batches_per_epoch)/args.num_epochs
+        elif args.max_hours is not None:
+            progress=elapsed/(args.max_hours*3600)
+        else:
+            progress=step/args.max_steps
+        progress=min(progress,1.)
         lr=args.lr*min(1.,(step+1)/max(args.warmup_steps,1))*(args.min_lr_ratio+(1-args.min_lr_ratio)*.5*(1+math.cos(math.pi*progress)))
         control[:]=torch.tensor([elapsed,STOP_REASONS.index(reason),lr],device=device)
     dist.broadcast(control,src=0)
@@ -245,7 +300,9 @@ def main():
                         'generation':'greedy','prefill_chunk_size':128},
             'objective':'Exact full-vocabulary KL(teacher || student) * T^2 + ce_weight * next-token CE; all nonpadding targets',
             'checkpointing':'non-reentrant decoder-layer and vocabulary-loss checkpoints; grouped LogKV',
-            'time_budget':'wall time from training start including periodic sampling/validation/saving; finalization may add a short tail'})
+            'time_budget':'unlimited unless max_hours is explicit; then wall time from original training start including downtime and periodic work',
+            'lr_schedule':'epoch progress' if args.num_epochs else 'wall time' if args.max_hours is not None else 'optimizer steps',
+            'epoch_policy':'per-rank loader pass; sampler and batch drop_last; partial accumulation at epoch end, no crossing into next epoch'})
     dist.barrier()
     tokenizer=AutoTokenizer.from_pretrained(SETTINGS.model_path,local_files_only=True)
     teacher,loading=LlamaForCausalLM.from_pretrained(SETTINGS.model_path,local_files_only=True,
@@ -271,8 +328,7 @@ def main():
         if complete['training_state_sha256']!=file_hash(args.resume/'training_state.pt'):
             raise ValueError('Training state checksum mismatch')
         saved=torch.load(args.resume/'training_state.pt',map_location='cpu',weights_only=True)
-        if saved['training_signature']!=training_signature(args):
-            raise ValueError('Resume training/data-order configuration differs')
+        check_resume_signature(saved['training_signature'],args)
         if saved['world_size']!=world:
             raise ValueError('Resume requires the original world size')
         optimizer.load_state_dict(saved['optimizer'])
@@ -289,9 +345,11 @@ def main():
     sampler=DistributedSampler(train_data,num_replicas=world,rank=rank,shuffle=True,seed=args.seed,drop_last=True)
     collate=partial(collate_tokens,sequence_length=args.sequence_length,pad_token_id=tokenizer.pad_token_id)
     loader=DataLoader(train_data,batch_size=args.batch_size,sampler=sampler,drop_last=True,
-                      collate_fn=collate,pin_memory=True,num_workers=0)
+                      collate_fn=collate,pin_memory=True,num_workers=0,
+                      generator=torch.Generator().manual_seed(args.seed))
     if not len(loader):
         raise ValueError('Too few training examples for global batch')
+    cursor=EpochBatchIterator(loader,sampler,epoch,batch_in_epoch)
     val_order=np.random.default_rng(args.seed+1).permutation(len(valid_data)).tolist()
     val_indices=val_order[rank::world]
     val_loader=DataLoader(Subset(valid_data,val_indices[:args.val_examples_per_rank]),
@@ -303,19 +361,9 @@ def main():
             'trainable_parameters':sum(p.numel() for p in params),'layers':len(model.student.layers),
             'train_examples':len(train_data),'valid_examples':len(valid_data),
             'global_examples_per_step':world*args.batch_size*args.grad_accum,
+            'batches_per_epoch_per_rank':len(loader),'optimizer_steps_per_epoch':math.ceil(len(loader)/args.grad_accum),
+            'num_epochs':args.num_epochs,'max_hours':args.max_hours,
             'grouped_forward':True,'lora_only':True,'frozen_teacher':True})
-    sampler.set_epoch(epoch); iterator=iter(loader)
-    for _ in range(batch_in_epoch):
-        next(iterator)
-    def next_batch():
-        nonlocal epoch,batch_in_epoch,iterator
-        try:
-            batch=next(iterator)
-        except StopIteration:
-            epoch+=1;batch_in_epoch=0;sampler.set_epoch(epoch);iterator=iter(loader)
-            batch=next(iterator)
-        batch_in_epoch+=1
-        return batch
     dist.barrier()
     started=time.monotonic()
     if not args.resume:
@@ -323,8 +371,13 @@ def main():
     else:
         prior_elapsed=time.time()-args.run_start_unix
     if rank==0:
+        remaining_seconds=None if args.max_hours is None else max(0,args.max_hours*3600-prior_elapsed)
         write_json(args.run_dir/'started.json',{'started_at':datetime.now(timezone.utc).isoformat(),
-            'pid':os.getpid(),'remaining_seconds':max(0,args.max_hours*3600-prior_elapsed),'step':step})
+            'pid':os.getpid(),'remaining_seconds':remaining_seconds,'step':step,
+            'num_epochs':args.num_epochs,'epoch':cursor.epoch,'batch_in_epoch':cursor.batch_in_epoch})
+        print(f'Training limits: epochs={args.num_epochs or "unlimited"}, '
+              f'time={str(args.max_hours)+" hours" if args.max_hours is not None else "unlimited"}, '
+              f'steps={args.max_steps or "unlimited"}; batches per epoch/rank={len(loader)}',flush=True)
     initial_validation=validate(model,val_loader,device)
     if rank==0:
         emit(args.run_dir,'validation.jsonl',{'step':step,'phase':'initial',**initial_validation})
@@ -333,15 +386,15 @@ def main():
         emit(args.run_dir,'validation.jsonl',{'step':step,'phase':'initial_all_heldout',**initial_all})
     if not args.skip_initial_samples:
         record_samples(model,tokenizer,args,step,rank,world,device,phase='initial')
-    reason='deadline'
     while True:
         elapsed,reason,lr=training_control(args,step,prior_elapsed+time.monotonic()-started,
-                                          stop_requested['value'],device)
+                                          stop_requested['value'],device,epoch=cursor.epoch,
+                                          batch_in_epoch=cursor.batch_in_epoch,batches_per_epoch=len(loader))
         if reason is not None:
             break
         for group in optimizer.param_groups:
             group['lr']=lr
-        batches=[next_batch() for _ in range(args.grad_accum)]
+        batches=cursor.next_update(args.grad_accum)
         count=torch.tensor(sum(int((lengths-1).sum()) for _,lengths in batches),device=device,dtype=torch.float64)
         dist.all_reduce(count)
         optimizer.zero_grad(set_to_none=True)
@@ -350,7 +403,7 @@ def main():
         totals=torch.zeros(3,device=device,dtype=torch.float64)
         from contextlib import nullcontext
         for micro,(ids,lengths) in enumerate(batches):
-            context=ddp.no_sync() if micro+1<args.grad_accum else nullcontext()
+            context=ddp.no_sync() if micro+1<len(batches) else nullcontext()
             with context:
                 with torch.autocast('cuda',dtype=torch.bfloat16):
                     loss,stats=ddp(ids.to(device,non_blocking=True),lengths.to(device,non_blocking=True))
@@ -374,6 +427,7 @@ def main():
                 'lr':lr,'kl':(totals[0]/totals[2]).item(),'ce':(totals[1]/totals[2]).item(),
                 'loss':((totals[0]+args.ce_weight*totals[1])/totals[2]).item(),
                 'grad_norm':norm.item(),'valid_tokens':int(totals[2].item()),'step_seconds':seconds,
+                'epoch':cursor.epoch,'batch_in_epoch':cursor.batch_in_epoch,'microbatches_per_rank':len(batches),
                 'valid_tokens_per_second':totals[2].item()/seconds,'max_rank_peak_allocated_bytes':int(peak.item())}
             emit(args.run_dir,'metrics.jsonl',metrics)
             if step==1 or step%10==0:
@@ -382,7 +436,7 @@ def main():
                 telemetry=subprocess.check_output(['nvidia-smi','--query-gpu=index,utilization.gpu,memory.used,power.draw','--format=csv,noheader,nounits'],text=True)
                 emit(args.run_dir,'gpu.jsonl',{'step':step,'read_at':datetime.now(timezone.utc).isoformat(),'csv':telemetry})
         if step%args.save_every==0:
-            save_checkpoint(model,optimizer,args,step,epoch,batch_in_epoch,prior_elapsed+time.monotonic()-started,world,rank)
+            save_checkpoint(model,optimizer,args,step,cursor.epoch,cursor.batch_in_epoch,prior_elapsed+time.monotonic()-started,world,rank)
         if step%args.validate_every==0:
             values=validate(model,val_loader,device)
             if rank==0:
@@ -398,7 +452,7 @@ def main():
     dist.all_gather_object(hashes,digest.hexdigest())
     if len(set(hashes))!=1:
         raise RuntimeError('Distributed adapter replicas diverged')
-    final_path=save_checkpoint(model,optimizer,args,step,epoch,batch_in_epoch,prior_elapsed+time.monotonic()-started,world,rank)
+    final_path=save_checkpoint(model,optimizer,args,step,cursor.epoch,cursor.batch_in_epoch,prior_elapsed+time.monotonic()-started,world,rank)
     values=None
     if reason!='save_and_exit':
         values=validate(model,final_val_loader,device)
@@ -407,6 +461,7 @@ def main():
         record_samples(model,tokenizer,args,step,rank,world,device,phase='final')
     if rank==0:
         write_json(args.run_dir/'completed.json',{'step':step,'reason':reason,'elapsed_seconds':prior_elapsed+time.monotonic()-started,
+            'epoch':cursor.epoch,'batch_in_epoch':cursor.batch_in_epoch,
             'completed_at':datetime.now(timezone.utc).isoformat(),'checkpoint':str(final_path),'validation':values,'adapter_hashes_by_rank':hashes})
         print(f'Training finished: {reason}; checkpoint={final_path}',flush=True)
     dist.destroy_process_group()
