@@ -309,6 +309,20 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv infer \
   --prompt '日本の首都はどこですか。短く答えてください。' --max-new-tokens 512
 ```
 
+ブラウザで対話する場合は、run名から最新checkpointを選択できる。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked python scripts/chat_server.py \
+  --run-name distill-20261102 --checkpoint latest --port 8000
+```
+
+`http://127.0.0.1:8000` で思考過程（analysis）と最終回答（final）をストリーム表示する。
+`--checkpoint /mnt/raid0/llm-jp-logkv/checkpoints/RUN/step-NNNNNNN` による直接指定も可能。
+元モデル重みとLoRAを読み込む推論専用サーバで、checkpointや訓練状態を書き換えない。
+既定はreasoning effort low、greedy、生成上限2,048 tokens（思考を含む）、入力上限8,192。
+停止・上限で未完了になったターンは次の会話履歴に追加しない。
+起動オプション・履歴・SSH転送の詳細は[READMEのチャットサーバ](../README.md#チェックポイントを使うチャットサーバ)を参照。
+
 ## 検証記録
 
 以下は初回の蒸留実装・8時間試行前の検証履歴。

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-jp LogKV Chat</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f5f6f8; color: #202936; font: 15px/1.65 system-ui, sans-serif; }
+  header, main, footer { max-width: 1000px; margin: auto; padding: 20px; }
+  header { border-bottom: 1px solid #d5dae2; }
+  h1 { margin: 0; font-size: 21px; }
+  #checkpoint { color: #5b6777; font-size: 12px; overflow-wrap: anywhere; }
+  .controls { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; align-items: end; }
+  label { display: grid; gap: 3px; font-size: 12px; }
+  input, select, button, textarea { font: inherit; border-radius: 7px; border: 1px solid #bac3d1; padding: 8px; }
+  input { width: 100px; }
+  button { cursor: pointer; background: #fff; }
+  button:disabled { cursor: default; opacity: .5; }
+  #send { background: #195eab; color: white; border-color: #195eab; }
+  #chat { min-height: 35vh; padding-bottom: 5px; }
+  article { background: white; border: 1px solid #e0e5ec; border-radius: 12px; margin-bottom: 20px; padding: 18px; }
+  article.user { background: #e7f0fb; margin-left: 12%; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .role, summary { font-weight: 600; }
+  .role { font-size: 12px; color: #5b6777; margin-bottom: 8px; }
+  details { margin: 10px 0; }
+  summary { cursor: pointer; font-size: 13px; }
+  .thinking { background: #f4f6f9; border-radius: 8px; padding: 10px; }
+  .thinking .text { color: #4c5868; }
+  .raw { font: 12px/1.5 monospace; color: #637082; }
+  .meta { font-size: 12px; color: #637082; margin-top: 12px; }
+  footer { position: sticky; bottom: 0; background: #f5f6f8f5; padding-top: 10px; }
+  textarea { width: 100%; min-height: 90px; resize: vertical; background: white; }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
+  #status { font-size: 12px; flex: 1; }
+  .hint { color: #637082; font-size: 12px; margin: 6px 0; }
+</style>
+<header>
+  <h1>llm-jp LogKV Chat</h1>
+  <div id="checkpoint">接続中…</div>
+  <div class="controls">
+    <label>Reasoning effort<select id="effort"><option>low</option><option>medium</option><option>high</option></select></label>
+    <label>Temperature<input id="temperature" type="number" min="0" max="2" step="0.1" value="0"></label>
+    <label>Top-p<input id="top_p" type="number" min="0.01" max="1" step="0.01" value="1"></label>
+    <label>生成上限 tokens<input id="limit" type="number" min="1" step="1" value="2048"></label>
+    <button id="reset" disabled>新しい会話</button>
+  </div>
+  <p class="hint">Temperature 0 はgreedy生成。生成上限には思考部分も含まれます。</p>
+</header>
+<main id="chat"><p id="welcome">メッセージを送ると、思考過程と回答が順次表示されます。</p></main>
+<footer>
+  <form id="form">
+    <textarea id="prompt" aria-label="メッセージ" placeholder="メッセージを入力…" required></textarea>
+    <div class="actions"><span id="status" role="status">接続中</span>
+      <button id="stop" type="button" disabled>停止</button><button id="send" disabled>送信</button></div>
+  </form>
+  <p class="hint">Enterで送信 / Shift+Enterで改行。会話はこのタブ内だけで保持し、再読込で消去します。</p>
+</footer>
+<script>
+  const $ = id => document.getElementById(id);
+  let history = [], active = null, config = null;
+  function scrollIfNearBottom() {
+    const near = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 220;
+    return () => { if (near) window.scrollTo(0, document.documentElement.scrollHeight); };
+  }
+  function bubble(role, text = '') {
+    $('welcome')?.remove();
+    const article = document.createElement('article'); article.className = role;
+    const label = document.createElement('div'); label.className = 'role';
+    label.textContent = role === 'user' ? 'あなた' : 'llm-jp LogKV'; article.append(label);
+    const body = document.createElement('div'); body.className = 'text'; body.textContent = text;
+    article.append(body); $('chat').append(article); return {article, body};
+  }
+  function responseBubble() {
+    const view = bubble('assistant'); view.nodes = [];
+    const rawBox = document.createElement('details'), summary = document.createElement('summary');
+    summary.textContent = '生の生成文字列（特殊トークンを含む）'; rawBox.append(summary);
+    view.raw = document.createElement('div'); view.raw.className = 'text raw'; rawBox.append(view.raw);
+    view.meta = document.createElement('div'); view.meta.className = 'meta';
+    view.article.append(rawBox, view.meta); return view;
+  }
+  function render(view, event) {
+    const scroll = scrollIfNearBottom();
+    for (const [i, part] of (event.parts || []).entries()) {
+      if (!view.nodes[i]) {
+        const text = document.createElement('div'); text.className = 'text';
+        if (part.channel === 'final') { view.body.append(text); }
+        else {
+          const box = document.createElement('details'); box.open = true; box.className = 'thinking';
+          const summary = document.createElement('summary');
+          summary.textContent = part.channel === 'analysis' ? '思考過程' : part.channel;
+          box.append(summary, text); view.body.append(box);
+        }
+        view.nodes[i] = text;
+      }
+      view.nodes[i].textContent = part.text;
+    }
+    view.raw.textContent = event.raw || ''; scroll();
+  }
+  function setBusy(busy) {
+    $('send').disabled = busy || !config; $('reset').disabled = busy || !config;
+    for (const id of ['effort', 'temperature', 'top_p', 'limit']) $(id).disabled = busy;
+    if (!busy) $('stop').disabled = true;
+  }
+  async function stop() {
+    if (!active) return;
+    $('stop').disabled = true; $('status').textContent = '停止中…';
+    try {
+      const response = await fetch('/api/stop', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({request_id: active.id})});
+      if (!response.ok) throw new Error('停止要求に失敗しました');
+    } catch (error) { $('status').textContent = error.message; $('stop').disabled = false; }
+  }
+  async function send(event) {
+    event.preventDefault();
+    if (active || !config || !$('form').reportValidity()) return;
+    for (const id of ['temperature', 'top_p', 'limit']) if (!$(id).reportValidity()) return;
+    const prompt = $('prompt').value.trim(); if (!prompt) return;
+    const messages = [...history, {role: 'user', content: prompt}];
+    const id = Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16)).join('-');
+    const controller = new AbortController(); active = {id, controller}; setBusy(true);
+    bubble('user', prompt); const view = responseBubble(); $('prompt').value = '';
+    $('status').textContent = '入力を準備中…';
+    let done = false;
+    try {
+      const response = await fetch('/api/chat', {method: 'POST', signal: controller.signal,
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({request_id: id, messages,
+          temperature: Number($('temperature').value), top_p: Number($('top_p').value),
+          max_new_tokens: Number($('limit').value), reasoning_effort: $('effort').value})});
+      if (!response.ok) throw new Error((await response.json()).error || `HTTP ${response.status}`);
+      const reader = response.body.getReader(), decoder = new TextDecoder(); let pending = '';
+      while (true) {
+        const chunk = await reader.read();
+        pending += decoder.decode(chunk.value || new Uint8Array(), {stream: !chunk.done});
+        let boundary;
+        while ((boundary = pending.indexOf('\n')) >= 0) {
+          const line = pending.slice(0, boundary); pending = pending.slice(boundary + 1);
+          if (!line) continue;
+          const item = JSON.parse(line);
+          if (item.type === 'start') $('stop').disabled = false;
+          if (item.type === 'prefill') $('status').textContent = `入力読込 ${item.processed_tokens}/${item.input_tokens} tokens`;
+          if (item.type === 'update') { render(view, item); $('status').textContent = `生成中 ${item.output_tokens} tokens`; }
+          if (item.type === 'error') throw new Error(item.error);
+          if (item.type === 'done') {
+            done = true; render(view, item);
+            const reason = {eos: '終了', length: '生成上限', cancelled: '停止'}[item.stop_reason] || item.stop_reason;
+            view.meta.textContent = `${item.input_tokens}+${item.output_tokens} tokens · ${item.tokens_per_second.toFixed(1)} tok/s · ${item.seconds.toFixed(1)}秒 · ${reason}`;
+            if (item.complete) {
+              history = [...messages, {role: 'assistant', content: item.final}];
+              $('status').textContent = '完了';
+            } else {
+              view.meta.textContent += '（未完了・このターンは次の会話履歴に含めません）';
+              $('status').textContent = '回答が未完了です。再送信するか、新しい質問を入力してください。';
+              if (!$('prompt').value) $('prompt').value = prompt;
+            }
+          }
+        }
+        if (chunk.done) break;
+      }
+      if (!done) throw new Error('生成の完了前に接続が切れました');
+    } catch (error) {
+      controller.abort(); view.meta.textContent = `エラー: ${error.message}（このターンは履歴に含めません）`;
+      $('status').textContent = error.message; if (!$('prompt').value) $('prompt').value = prompt;
+    } finally { active = null; setBusy(false); $('prompt').focus(); }
+  }
+  $('form').addEventListener('submit', send);
+  $('prompt').addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+      event.preventDefault(); $('form').requestSubmit();
+    }
+  });
+  $('stop').addEventListener('click', stop);
+  $('reset').addEventListener('click', () => {
+    history = []; $('chat').replaceChildren(); $('prompt').value = '';
+    $('status').textContent = '新しい会話'; $('prompt').focus();
+  });
+  window.addEventListener('pagehide', () => {
+    if (active) {
+      fetch('/api/stop', {method: 'POST', keepalive: true, headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({request_id: active.id})}).catch(() => {});
+      active.controller.abort();
+    }
+  });
+  fetch('/api/config').then(response => {
+    if (!response.ok) throw new Error('サーバに接続できません'); return response.json();
+  }).then(value => {
+    config = value; $('checkpoint').textContent = value.checkpoint;
+    $('temperature').value = value.temperature; $('top_p').value = value.top_p;
+    $('limit').value = value.max_new_tokens; $('limit').max = value.max_new_tokens;
+    $('effort').value = value.reasoning_effort;
+    $('status').textContent = `準備完了 · 入力上限 ${value.max_input_tokens} tokens`;
+    setBusy(false); $('prompt').focus();
+  }).catch(error => { $('status').textContent = error.message; });
+</script>
+</html>

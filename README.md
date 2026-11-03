@@ -5,7 +5,7 @@ LogKV に置換し、蒸留・追加学習による適応を検証するプロ�
 
 元Llamaの全32層でQ/K/V/O、RoPE、FFN、RMSNormを流用し、Attentionのみ
 LogKVに変更する独立推論APIとCLI、および固定減衰LogKVのLoRA蒸留を実装しています。
-TransformersのCache/model.generateへの組み込みは未対応で、独自のgreedy生成を使用します。
+TransformersのCache/model.generateへの組み込みは未対応で、独自の生成処理を使用します。
 初期評価では元モデルが4問とも正答した一方、未蒸留LogKVの両条件は反復出力となりました。
 [実重みでの初期品質・性能結果](doc/initial-quality-20261102.md)を参照してください。
 蒸留の設定・データ・再現手順は[蒸留実験記録](doc/distillation-20261102.md)にまとめています。
@@ -125,6 +125,45 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked llm-jp-logkv evaluate-initia
 manifestにソースcommit、model revision、依存関係、設定、入力suiteを記録します。
 固定文章のNLL/PPLと生成例は小さな手書きsmoke検証で、標準ベンチマークではありません。
 性能値は生成全体の時間と割当ピークの参考値です。速度比較に特化した測定ではありません。
+
+## チェックポイントを使うチャットサーバ
+
+```bash
+# run内の保存完了済み最大stepを起動時に選択し、1 GPUでロードする
+CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked python scripts/chat_server.py \
+  --run-name distill-20261102 --checkpoint latest
+
+# 特定のcheckpointを指定する場合
+CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked python scripts/chat_server.py \
+  --checkpoint /mnt/raid0/llm-jp-logkv/checkpoints/distill-20261102/step-0002599 \
+  --port 8000
+```
+
+ブラウザで `http://127.0.0.1:8000` を開く。`--run-name` 指定時の
+`--checkpoint` の既定値は `latest`。step名の指定も可能で、起動後の自動切替は行わない。
+固定revisionの元モデル重みとcheckpointのLoRAを読み込み、model revisionとadapterの
+hashを検査する。LoRA rank・alpha・LogKV chunk sizeはcheckpointの設定を使用する。
+
+- 思考過程（analysis）と最終回答（final）を分けてストリーム表示。思考と生の生成文字列は
+  折り畳み可能で、表示にはモデルが実際に生成した内容を使用する。
+- 画面でreasoning effort、temperature、top-p、生成上限を変更可能。
+  既定はlow、temperature 0（greedy）、top-p 1、最大2,048 tokens。
+  `--max-new-tokens` は画面の初期値と上限を設定し、思考部分もこの上限に含む。
+- 「停止」はprefillのチャンク間・生成のトークン間で反映する。「新しい会話」で履歴を消去。
+  EOSで最終回答が完了したターンだけを次の履歴に含める。停止・上限・通信エラーの場合は
+  未完了と表示し、そのターンを履歴に追加しない。
+- 会話履歴はタブ内のみで保持する。各ターンで元のHarmony templateに履歴を渡して
+  prefillし直し、前ターンのanalysisを再入力しない。同時生成は1件で、他の要求にはbusyを返す。
+- 入力上限は既定8,192 tokens（`--max-input-tokens`）。長すぎる履歴は切り詰めずエラーにする。
+  `--prefill-chunk-size` は既定128。表示の `93+16 tokens` は入力+生成トークン数で、
+  tok/sはprefillを除いた生成区間の値、秒数はprefillを含む。
+
+追加依存なしのローカルサーバ（認証なし）で、既定hostは `127.0.0.1`。
+SSH先で起動した場合はVS Codeのポート転送、または
+`ssh -L 8000:127.0.0.1:8000 HOST` でアクセスできる。
+`--device cuda:0`、`--host`、`--port` も指定可能。Ctrl+Cでサーバを終了する。
+起動条件は `${LOG_DIR}/chat-*.json` に保存し、会話本文はサーバのファイルへ保存しない。
+本体プロジェクトの作業ツリーやサーバ用Python環境には依存しない。
 
 ## 検証
 
