@@ -319,8 +319,12 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked python scripts/chat_server.p
 `http://127.0.0.1:8000` で思考過程（analysis）と最終回答（final）をストリーム表示する。
 `--checkpoint /mnt/raid0/llm-jp-logkv/checkpoints/RUN/step-NNNNNNN` による直接指定も可能。
 元モデル重みとLoRAを読み込む推論専用サーバで、checkpointや訓練状態を書き換えない。
-既定はreasoning effort low、greedy、生成上限2,048 tokens（思考を含む）、入力上限8,192。
-停止・上限で未完了になったターンは次の会話履歴に追加しない。
+既定はreasoning effort low、greedy、毎ターンの生成上限2,048 tokens（思考を含む）。
+入力トークン数の上限は撤去した。ブラウザのタブごとにLogKV状態を保持し、2ターン目以降は
+新しい質問だけを追加する。過去の思考も状態に残り、履歴を読み直さない。
+生成中の停止・上限では部分応答を保持してターンを閉じ、入力読込途中の停止は破棄する。
+無操作の状態は既定30分で解放する（`--session-ttl`、秒単位）。新しい会話で状態をリセットする。
+Reasoning effortは会話開始時に固定し、変更するときは新しい会話を開始する。
 起動オプション・履歴・SSH転送の詳細は[READMEのチャットサーバ](../README.md#チェックポイントを使うチャットサーバ)を参照。
 
 ## 検証記録

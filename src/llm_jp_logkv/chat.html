@@ -45,7 +45,7 @@
     <label>生成上限 tokens<input id="limit" type="number" min="1" step="1" value="2048"></label>
     <button id="reset" disabled>新しい会話</button>
   </div>
-  <p class="hint">Temperature 0 はgreedy生成。生成上限には思考部分も含まれます。</p>
+  <p class="hint">Temperature 0 はgreedy生成。生成上限には思考部分も含まれます。Reasoning effortの変更は「新しい会話」から。</p>
 </header>
 <main id="chat"><p id="welcome">メッセージを送ると、思考過程と回答が順次表示されます。</p></main>
 <footer>
@@ -54,11 +54,11 @@
     <div class="actions"><span id="status" role="status">接続中</span>
       <button id="stop" type="button" disabled>停止</button><button id="send" disabled>送信</button></div>
   </form>
-  <p class="hint">Enterで送信 / Shift+Enterで改行。会話はこのタブ内だけで保持し、再読込で消去します。</p>
+  <p class="hint">Enterで送信 / Shift+Enterで改行。思考を含む会話状態をサーバで保持します。再読込・「新しい会話」でリセットします。</p>
 </footer>
 <script>
   const $ = id => document.getElementById(id);
-  let history = [], active = null, config = null;
+  let active = null, config = null, sessionId = null, turn = 0, hasState = false, sessionLost = false;
   function scrollIfNearBottom() {
     const near = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 220;
     return () => { if (near) window.scrollTo(0, document.documentElement.scrollHeight); };
@@ -98,8 +98,9 @@
     view.raw.textContent = event.raw || ''; scroll();
   }
   function setBusy(busy) {
-    $('send').disabled = busy || !config; $('reset').disabled = busy || !config;
-    for (const id of ['effort', 'temperature', 'top_p', 'limit']) $(id).disabled = busy;
+    $('send').disabled = busy || !config || !sessionId || sessionLost; $('reset').disabled = busy || !config;
+    for (const id of ['temperature', 'top_p', 'limit']) $(id).disabled = busy;
+    $('effort').disabled = busy || hasState;
     if (!busy) $('stop').disabled = true;
   }
   async function stop() {
@@ -107,16 +108,15 @@
     $('stop').disabled = true; $('status').textContent = '停止中…';
     try {
       const response = await fetch('/api/stop', {method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({request_id: active.id})});
+        body: JSON.stringify({session_id: sessionId, request_id: active.id})});
       if (!response.ok) throw new Error('停止要求に失敗しました');
     } catch (error) { $('status').textContent = error.message; $('stop').disabled = false; }
   }
   async function send(event) {
     event.preventDefault();
-    if (active || !config || !$('form').reportValidity()) return;
+    if (active || !config || !sessionId || sessionLost || !$('form').reportValidity()) return;
     for (const id of ['temperature', 'top_p', 'limit']) if (!$(id).reportValidity()) return;
     const prompt = $('prompt').value.trim(); if (!prompt) return;
-    const messages = [...history, {role: 'user', content: prompt}];
     const id = Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16)).join('-');
     const controller = new AbortController(); active = {id, controller}; setBusy(true);
     bubble('user', prompt); const view = responseBubble(); $('prompt').value = '';
@@ -124,10 +124,14 @@
     let done = false;
     try {
       const response = await fetch('/api/chat', {method: 'POST', signal: controller.signal,
-        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({request_id: id, messages,
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: sessionId, turn, request_id: id, prompt,
           temperature: Number($('temperature').value), top_p: Number($('top_p').value),
           max_new_tokens: Number($('limit').value), reasoning_effort: $('effort').value})});
-      if (!response.ok) throw new Error((await response.json()).error || `HTTP ${response.status}`);
+      if (!response.ok) {
+        const failure = await response.json();
+        if (['session_expired', 'stale_turn'].includes(failure.code)) sessionLost = true;
+        throw new Error(failure.error || `HTTP ${response.status}`);
+      }
       const reader = response.body.getReader(), decoder = new TextDecoder(); let pending = '';
       while (true) {
         const chunk = await reader.read();
@@ -137,21 +141,21 @@
           const line = pending.slice(0, boundary); pending = pending.slice(boundary + 1);
           if (!line) continue;
           const item = JSON.parse(line);
-          if (item.type === 'start') $('stop').disabled = false;
+          if (item.type === 'start') { $('stop').disabled = false; view.meta.textContent = `保持済み ${item.cached_tokens} tokens`; }
           if (item.type === 'prefill') $('status').textContent = `入力読込 ${item.processed_tokens}/${item.input_tokens} tokens`;
           if (item.type === 'update') { render(view, item); $('status').textContent = `生成中 ${item.output_tokens} tokens`; }
           if (item.type === 'error') throw new Error(item.error);
           if (item.type === 'done') {
             done = true; render(view, item);
             const reason = {eos: '終了', length: '生成上限', cancelled: '停止'}[item.stop_reason] || item.stop_reason;
-            view.meta.textContent = `${item.input_tokens}+${item.output_tokens} tokens · ${item.tokens_per_second.toFixed(1)} tok/s · ${item.seconds.toFixed(1)}秒 · ${reason}`;
+            view.meta.textContent = `${item.input_tokens}+${item.output_tokens} tokens · 状態累計 ${item.session_tokens} tokens · ${item.tokens_per_second.toFixed(1)} tok/s · ${item.seconds.toFixed(1)}秒 · ${reason}`;
+            turn = item.turn; hasState = item.session_tokens > 0;
             if (item.complete) {
-              history = [...messages, {role: 'assistant', content: item.final}];
               $('status').textContent = '完了';
             } else {
-              view.meta.textContent += '（未完了・このターンは次の会話履歴に含めません）';
-              $('status').textContent = '回答が未完了です。再送信するか、新しい質問を入力してください。';
-              if (!$('prompt').value) $('prompt').value = prompt;
+              view.meta.textContent += item.retained ? '（未完了・途中までの思考と応答を保持）' : '（入力読込を中断・このターンは保持しません）';
+              $('status').textContent = item.retained ? '途中までの状態を保持しました。次の質問を入力できます。' : '入力を中断しました。再送信できます。';
+              if (!item.retained && !$('prompt').value) $('prompt').value = prompt;
             }
           }
         }
@@ -159,7 +163,7 @@
       }
       if (!done) throw new Error('生成の完了前に接続が切れました');
     } catch (error) {
-      controller.abort(); view.meta.textContent = `エラー: ${error.message}（このターンは履歴に含めません）`;
+      controller.abort(); view.meta.textContent = `エラー: ${error.message}`;
       $('status').textContent = error.message; if (!$('prompt').value) $('prompt').value = prompt;
     } finally { active = null; setBusy(false); $('prompt').focus(); }
   }
@@ -170,17 +174,30 @@
     }
   });
   $('stop').addEventListener('click', stop);
-  $('reset').addEventListener('click', () => {
-    history = []; $('chat').replaceChildren(); $('prompt').value = '';
-    $('status').textContent = '新しい会話'; $('prompt').focus();
-  });
+  async function newSession() {
+    const oldId = sessionId;
+    sessionId = null; setBusy(true);
+    try {
+      if (oldId) {
+        const closed = await fetch('/api/close', {method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({session_id: oldId})});
+        if (!closed.ok) throw new Error('会話のリセットに失敗しました');
+      }
+      const response = await fetch('/api/session', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+      if (!response.ok) throw new Error('セッションを作成できません');
+      const session = await response.json(); sessionId = session.session_id; turn = session.turn;
+      hasState = false; sessionLost = false; $('chat').replaceChildren(); $('prompt').value = '';
+      $('status').textContent = `準備完了 · 無操作 ${config.session_ttl} 秒で状態を解放`;
+    } catch (error) { $('status').textContent = error.message; }
+    finally { setBusy(false); $('prompt').focus(); }
+  }
+  $('reset').addEventListener('click', newSession);
   window.addEventListener('pagehide', () => {
-    if (active) {
-      fetch('/api/stop', {method: 'POST', keepalive: true, headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({request_id: active.id})}).catch(() => {});
-      active.controller.abort();
-    }
+    if (sessionId) fetch('/api/close', {method: 'POST', keepalive: true,
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: sessionId})}).catch(() => {});
+    if (active) active.controller.abort();
   });
+  window.addEventListener('pageshow', event => { if (event.persisted && config) newSession(); });
   fetch('/api/config').then(response => {
     if (!response.ok) throw new Error('サーバに接続できません'); return response.json();
   }).then(value => {
@@ -188,8 +205,7 @@
     $('temperature').value = value.temperature; $('top_p').value = value.top_p;
     $('limit').value = value.max_new_tokens; $('limit').max = value.max_new_tokens;
     $('effort').value = value.reasoning_effort;
-    $('status').textContent = `準備完了 · 入力上限 ${value.max_input_tokens} tokens`;
-    setBusy(false); $('prompt').focus();
+    return newSession();
   }).catch(error => { $('status').textContent = error.message; });
 </script>
 </html>

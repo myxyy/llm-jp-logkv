@@ -1,14 +1,16 @@
 """Local, single-model chat server. No HF imports until settings are loaded.
 
-POST /api/chat streams newline-delimited JSON. The browser owns its conversation;
-each turn uses the original chat template and a fresh LogKV state. Inference is
-serialized, with cancellation checked between prefill chunks and decode steps.
+POST /api/chat streams newline-delimited JSON. Each browser session retains its
+LogKV state, including analysis, until reset or idle expiry. Only new input is
+prefilled. Inference is serialized across sessions.
 """
 import argparse
+from dataclasses import dataclass
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import secrets
 from pathlib import Path
 import threading
 import time
@@ -34,8 +36,8 @@ def parse_args(argv=None):
     parser.add_argument('--device', default='cuda:0', help='cuda:0, cuda:1, cpu, or GPU index')
     parser.add_argument('--max-new-tokens', type=positive_int, default=2048,
                         help='Default and maximum output length per turn, including analysis')
-    parser.add_argument('--max-input-tokens', type=positive_int, default=8192,
-                        help='Reject longer histories; never silently truncate')
+    parser.add_argument('--session-ttl', type=positive_int, default=1800,
+                        help='Seconds to retain idle session states (default: 1800)')
     parser.add_argument('--prefill-chunk-size', type=positive_int, default=128)
     parser.add_argument('--reasoning-effort', choices=['low', 'medium', 'high'], default='low')
     parser.add_argument('--temperature', type=float, default=0., help='0 = greedy; range 0–2')
@@ -75,18 +77,14 @@ def validate_request(body, defaults):
     request_id = body.get('request_id')
     if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
         raise ValueError('request_id must be a nonempty string of at most 128 characters')
-    messages = body.get('messages')
-    if not isinstance(messages, list) or not messages or len(messages) > 201:
-        raise ValueError('messages must contain 1–201 user/assistant messages')
-    clean = []
-    for i, message in enumerate(messages):
-        role = 'user' if i % 2 == 0 else 'assistant'
-        if (not isinstance(message, dict) or message.get('role') != role
-                or not isinstance(message.get('content'), str) or not message['content'].strip()):
-            raise ValueError('Alternate nonempty user/assistant messages, starting and ending with user')
-        clean.append({'role': role, 'content': message['content']})
-    if len(clean) % 2 == 0:
-        raise ValueError('The last message must be user')
+    session_id(body)
+    if type(body.get('turn')) is not int or body['turn'] < 0:
+        raise ValueError('turn must be a nonnegative integer')
+    prompt = body.get('prompt')
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError('prompt must be a nonempty string')
+    if 'messages' in body:
+        raise ValueError('Send only the new prompt; conversation state is held by the server')
     options = {}
     for key, lower, upper in [('temperature', 0, 2), ('top_p', 0, 1)]:
         value = body.get(key, getattr(defaults, key))
@@ -100,7 +98,36 @@ def validate_request(body, defaults):
     effort = body.get('reasoning_effort', defaults.reasoning_effort)
     if effort not in ('low', 'medium', 'high'):
         raise ValueError('Invalid reasoning_effort')
-    return request_id, clean, dict(options, max_new_tokens=limit, reasoning_effort=effort)
+    return request_id, prompt, dict(options, max_new_tokens=limit, reasoning_effort=effort)
+
+
+def session_id(body):
+    value = body.get('session_id') if isinstance(body, dict) else None
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        raise ValueError('session_id is required')
+    return value
+
+
+@dataclass
+class ChatSession:
+    state: object = None
+    effort: str | None = None
+    turn: int = 0
+    last_used: float = 0.
+
+
+@dataclass
+class PreparedTurn:
+    ids: object
+    initial_state: object
+    result_state: object = None
+    retained: bool = False
+
+
+class SessionError(ValueError):
+    def __init__(self, status, code, message):
+        super().__init__(message)
+        self.status, self.code = status, code
 
 
 class HarmonyOutput:
@@ -119,17 +146,26 @@ class HarmonyOutput:
         self.tokens, self.parts, self.header = [], [], []
         self.in_body = False
         self.has_channel = False
+        self.message_open = True  # The generation prompt ends in <|start|>assistant.
+
+    def closing_tokens(self):
+        if not self.message_open:
+            return []
+        names = ['end'] if self.in_body else ['message', 'end']
+        return [self.tokenizer.convert_tokens_to_ids(f'<|{name}|>') for name in names]
 
     def push(self, token):
         self.tokens.append(token)
         kind = self.special.get(token)
         if kind in ('start', 'end', 'return'):
+            self.message_open = kind == 'start'
             self.in_body, self.has_channel = False, False
             self.header = []
         elif kind == 'channel':
             self.in_body, self.has_channel = False, True
             self.header = []
         elif kind == 'message':
+            self.message_open = True
             header = self.decode(self.header).strip().split()
             channel = header[0] if self.has_channel and header else 'final'
             self.parts.append({'channel': channel, 'tokens': []})
@@ -172,34 +208,42 @@ class ChatEngine:
         self.model, self.tokenizer, self.args = model, tokenizer, args
         self.conversation_date = date.today().isoformat()
 
-    def prepare(self, messages, options):
-        ids = self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors='pt',
-            return_dict=True, reasoning_effort=options['reasoning_effort'],
-            conversation_start_date=self.conversation_date).input_ids
-        if ids.shape[1] > self.args.max_input_tokens:
-            raise ValueError(f'Input has {ids.shape[1]} tokens; limit is {self.args.max_input_tokens}. '
-                             'Start a new conversation or increase --max-input-tokens.')
-        if ids.shape[1] + options['max_new_tokens'] > self.model.config.max_position_embeddings:
-            raise ValueError('Input plus output limit exceeds model context length')
-        return ids.to(self.args.device)
+    def prepare(self, prompt, options, session):
+        if session.effort is not None and options['reasoning_effort'] != session.effort:
+            raise ValueError('Reasoning effort is fixed for this session. Start a new conversation to change it.')
+        rendered = self.tokenizer.apply_chat_template(
+            [{'role': 'user', 'content': prompt}], tokenize=False, add_generation_prompt=True,
+            reasoning_effort=options['reasoning_effort'], conversation_start_date=self.conversation_date)
+        if session.state is not None:
+            # The pinned llm-jp Harmony template emits the system prefix once.
+            # Past analysis/final tokens already live in the compressed state.
+            marker = '<|start|>user<|message|>'
+            _, separator, suffix = rendered.partition(marker)
+            if not separator:
+                raise ValueError('Expected llm-jp Harmony user framing in the chat template')
+            rendered = separator + suffix
+        ids = self.tokenizer(rendered, add_special_tokens=False, return_tensors='pt').input_ids
+        return PreparedTurn(ids.to(self.args.device), session.state)
 
-    def stream(self, ids, options, cancel):
+    def stream(self, turn, options, cancel):
         import torch
         # inference_mode must be entered in the HTTP worker thread.
         with torch.inference_mode():
-            state, reason, count = None, 'length', 0
+            ids, state = turn.ids, turn.initial_state
+            cached = state.offset if state is not None else 0
+            reason, count, prefilled = 'length', 0, 0
             eos = self.model.config.eos_token_id
             eos = set([eos] if isinstance(eos, int) else (eos or []))
             output = HarmonyOutput(self.tokenizer, eos)
             started = time.perf_counter()
             decode_started = None
-            yield {'type': 'start', 'input_tokens': ids.shape[1]}
+            yield {'type': 'start', 'input_tokens': ids.shape[1], 'cached_tokens': cached}
             for part in ids.split(self.args.prefill_chunk_size, dim=1):
                 if cancel.is_set():
                     break
                 logits, state = self.model(part, state, logits_to_keep=1)
-                yield {'type': 'prefill', 'processed_tokens': state.offset, 'input_tokens': ids.shape[1]}
+                prefilled += part.shape[1]
+                yield {'type': 'prefill', 'processed_tokens': prefilled, 'input_tokens': ids.shape[1]}
             if not cancel.is_set():
                 decode_started = time.perf_counter()
                 for _ in range(options['max_new_tokens']):
@@ -207,48 +251,103 @@ class ChatEngine:
                         break
                     token = sample_token(logits[0, -1], options['temperature'], options['top_p'])
                     count += 1
+                    # In the original template, past assistant turns end in
+                    # <|end|>; <|return|>/EOS is an output-only boundary. Consume
+                    # that boundary as <|end|>, keeping all analysis/final bodies.
+                    consume = output.closing_tokens() if token in eos else [token]
                     output.push(token)
+                    if consume:
+                        logits, state = self.model(ids.new_tensor([consume]), state, logits_to_keep=1)
                     yield {'type': 'update', 'output_tokens': count, **output.snapshot()}
                     if token in eos:
                         reason = 'eos'
                         break
-                    if count < options['max_new_tokens'] and not cancel.is_set():
-                        logits, state = self.model(ids.new_tensor([[token]]), state, logits_to_keep=1)
             if cancel.is_set():
                 reason = 'cancelled'
+            # Only a fully prefilled user turn may be retained. Stop/length can
+            # retain a partial assistant response, closed before the next user.
+            # A disconnect/exception closes this generator without committing.
+            if prefilled == ids.shape[1]:
+                closing = output.closing_tokens()
+                if closing:
+                    _, state = self.model(ids.new_tensor([closing]), state, logits_to_keep=1)
+                turn.result_state, turn.retained = state, True
             ended = time.perf_counter()
             snapshot = output.snapshot(finished=True)
             final = ''.join(p['text'] for p in snapshot['parts'] if p['channel'] == 'final')
             yield {'type': 'done', 'stop_reason': reason, 'input_tokens': ids.shape[1],
-                   'output_tokens': count, 'seconds': ended - started,
+                   'cached_tokens': cached, 'session_tokens': state.offset if turn.retained else cached,
+                   'retained': turn.retained, 'output_tokens': count, 'seconds': ended - started,
                    'tokens_per_second': count / max(ended - decode_started, 1e-9) if decode_started else 0,
                    'final': final, 'complete': reason == 'eos' and bool(final.strip()), **snapshot}
 
 
 class ChatApplication:
-    def __init__(self, engine, args, checkpoint):
+    def __init__(self, engine, args, checkpoint, *, clock=time.monotonic):
         self.engine, self.args = engine, args
         self.checkpoint = str(checkpoint)
         self.lock = threading.Lock()
         self.active = None
+        self.sessions = {}
+        self.clock = clock
 
-    def claim(self, request_id):
+    def _expire(self):
+        now = self.clock()
+        active_id = self.active[0] if self.active else None
+        for key, session in list(self.sessions.items()):
+            if key != active_id and now - session.last_used >= self.args.session_ttl:
+                del self.sessions[key]
+
+    def expire(self):
         with self.lock:
+            self._expire()
+
+    def create(self):
+        with self.lock:
+            self._expire()
+            key = secrets.token_urlsafe(32)
+            self.sessions[key] = ChatSession(last_used=self.clock())
+            return key
+
+    def discard(self, key):
+        with self.lock:
+            if self.active and self.active[0] == key:
+                self.active[2].set()
+            self.sessions.pop(key, None)
+
+    def claim(self, key, expected_turn, request_id):
+        with self.lock:
+            self._expire()
+            session = self.sessions.get(key)
+            if session is None:
+                raise SessionError(410, 'session_expired', 'Session expired or server restarted. Start a new conversation.')
             if self.active is not None:
-                return None
+                raise SessionError(409, 'busy', 'Another response is being generated. Retry after it finishes.')
+            if session.turn != expected_turn:
+                raise SessionError(409, 'stale_turn', 'Session has advanced. Start a new conversation to avoid replaying a turn.')
             cancel = threading.Event()
-            self.active = (request_id, cancel)
-            return cancel
+            self.active = (key, request_id, cancel)
+            return session, cancel
 
-    def stop(self, request_id=None):
+    def commit(self, key, turn, effort):
         with self.lock:
-            if self.active and (request_id is None or request_id == self.active[0]):
-                self.active[1].set()
+            if key in self.sessions and turn.retained:
+                session = self.sessions[key]
+                session.state, session.effort = turn.result_state, effort
+                session.turn += 1
+
+    def stop(self, request_id=None, key=None):
+        with self.lock:
+            if self.active and (request_id is None or
+                    (request_id == self.active[1] and key == self.active[0])):
+                self.active[2].set()
                 return True
             return False
 
     def release(self):
         with self.lock:
+            if self.active and self.active[0] in self.sessions:
+                self.sessions[self.active[0]].last_used = self.clock()
             self.active = None
 
 
@@ -274,7 +373,7 @@ def make_server(app, host, port):
             elif self.path == '/api/config':
                 self.respond(200, {'checkpoint': app.checkpoint, **{
                     key: getattr(app.args, key) for key in
-                    ('max_new_tokens', 'max_input_tokens', 'temperature', 'top_p', 'reasoning_effort')}})
+                    ('max_new_tokens', 'session_ttl', 'temperature', 'top_p', 'reasoning_effort')}})
             else:
                 self.respond(404, {'error': 'Not found'})
 
@@ -285,33 +384,44 @@ def make_server(app, host, port):
             if self.headers.get_content_type() != 'application/json':
                 raise ValueError('Content-Type must be application/json')
             size = int(self.headers.get('Content-Length', '0'))
-            if not 0 < size <= 1_000_000:
-                raise ValueError('JSON body must be 1–1000000 bytes')
+            if size <= 0:
+                raise ValueError('A nonempty JSON body with Content-Length is required')
             return json.loads(self.rfile.read(size))
 
         def do_POST(self):
-            if self.path not in ('/api/chat', '/api/stop'):
+            if self.path not in ('/api/chat', '/api/stop', '/api/session', '/api/close'):
                 self.respond(404, {'error': 'Not found'})
                 return
             try:
                 body = self.read_body()
+                if not isinstance(body, dict):
+                    raise ValueError('Expected a JSON object')
+                if self.path == '/api/session':
+                    self.respond(200, {'session_id': app.create(), 'turn': 0})
+                    return
+                key = session_id(body)
+                if self.path == '/api/close':
+                    app.discard(key)
+                    self.respond(200, {'closed': True})
+                    return
                 if self.path == '/api/stop':
                     if not isinstance(body, dict) or not isinstance(body.get('request_id'), str):
                         raise ValueError('request_id is required')
-                    self.respond(200, {'stopped': app.stop(body['request_id'])})
+                    self.respond(200, {'stopped': app.stop(body['request_id'], key)})
                     return
-                request_id, messages, options = validate_request(body, app.args)
+                request_id, prompt, options = validate_request(body, app.args)
             except (ValueError, OSError) as exc:
                 self.respond(400, {'error': str(exc)})
                 return
-            cancel = app.claim(request_id)
-            if cancel is None:
-                self.respond(409, {'error': 'Another response is being generated. Retry after it finishes.'})
+            try:
+                session, cancel = app.claim(key, body['turn'], request_id)
+            except SessionError as exc:
+                self.respond(exc.status, {'error': str(exc), 'code': exc.code})
                 return
             stream = None
             streaming = False
             try:
-                ids = app.engine.prepare(messages, options)
+                turn = app.engine.prepare(prompt, options, session)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
                 self.send_header('Cache-Control', 'no-store')
@@ -319,9 +429,13 @@ def make_server(app, host, port):
                 self.send_header('Connection', 'close')
                 self.end_headers()
                 streaming = True
-                stream = app.engine.stream(ids, options, cancel)
+                stream = app.engine.stream(turn, options, cancel)
                 for event in stream:
+                    if event['type'] == 'done':
+                        event['turn'] = session.turn + int(turn.retained)
                     self.send_event(event)
+                    if event['type'] == 'done':
+                        app.commit(key, turn, options['reasoning_effort'])
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 cancel.set()
             except Exception as exc:
@@ -342,7 +456,12 @@ def make_server(app, host, port):
             self.wfile.write((json.dumps(event, ensure_ascii=False) + '\n').encode())
             self.wfile.flush()
 
-    return ThreadingHTTPServer((host, port), Handler)
+    class Server(ThreadingHTTPServer):
+        def service_actions(self):
+            # Run even without incoming requests; never expire an active turn.
+            app.expire()
+
+    return Server((host, port), Handler)
 
 
 def main(argv=None):

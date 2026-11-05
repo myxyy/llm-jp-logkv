@@ -31,6 +31,11 @@
 
 # Implementation and verification
 
+- Chat keeps per-browser LogKV state, including analysis, until reset/idle expiry.
+  Append only the new turn; do not re-prefill history or reintroduce input/context
+  token caps. Keep the per-turn output cap, session isolation, atomic state commits,
+  and reasoning effort fixed per conversation. Normalize EOS to the original
+  Harmony past-turn boundary, and retain partial output only after full input prefill.
 - Data preparation defaults to all three reasoning splits and 100,000 candidates
   per subset across those splits. Keep first-exchange/length/dedup/split filters;
   use a new cache directory and retain split provenance in records/manifests.
