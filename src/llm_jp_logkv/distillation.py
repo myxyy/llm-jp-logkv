@@ -1,7 +1,7 @@
 """Trainable adapters and exact, chunked full-vocabulary distillation loss.
 
-The frozen teacher and student share only frozen base modules. LoRA wrappers
-are installed on the student's attention adapter objects, never on the teacher.
+The frozen teacher and student share only frozen base modules. Trainable LoRA
+or full projection weights belong to the student, never to the teacher.
 """
 import math
 from functools import partial
@@ -40,6 +40,31 @@ def add_lora(student, rank=32, alpha=64):
             setattr(attention, name, LoRALinear(getattr(attention, name), rank, alpha))
 
 
+class FullAttentionLinear(nn.Module):
+    """Independent pretrained Q/K/V/O weights with FP32 master parameters.
+
+    Cast for the current computation as in LoRA, without retaining a frozen
+    base projection inside this module or modifying the teacher's parameters.
+    """
+
+    def __init__(self, base):
+        super().__init__()
+        self.in_features, self.out_features = base.in_features, base.out_features
+        self.weight = nn.Parameter(base.weight.detach().to(dtype=torch.float32, copy=True))
+        self.bias = (None if base.bias is None else
+                     nn.Parameter(base.bias.detach().to(dtype=torch.float32, copy=True)))
+
+    def forward(self, x):
+        return F.linear(x, self.weight.to(x.dtype),
+                        None if self.bias is None else self.bias.to(x.dtype))
+
+
+def add_full_attention(student):
+    for attention in student.attentions:
+        for name in ('q_proj', 'k_proj', 'v_proj', 'o_proj'):
+            setattr(attention, name, FullAttentionLinear(getattr(attention, name)))
+
+
 def adapter_state(student):
     return {name: p.detach().cpu().clone() for name, p in student.named_parameters()
             if p.requires_grad}
@@ -59,8 +84,11 @@ def load_adapter(student, state):
 class DistillationModel(nn.Module):
     def __init__(self, teacher, *, rank=32, alpha=64, chunk_size=4,
                  loss_chunk_tokens=64, temperature=1., ce_weight=.1,
-                 checkpoint_layers=True, no_rope=False, conv_kernel_size=0):
+                 checkpoint_layers=True, no_rope=False, conv_kernel_size=0,
+                 attention_training='lora'):
         super().__init__()
+        if attention_training not in ('lora', 'full'):
+            raise ValueError('attention_training must be lora or full')
         if temperature <= 0 or ce_weight < 0 or loss_chunk_tokens <= 0:
             raise ValueError('Invalid loss settings')
         teacher.requires_grad_(False)
@@ -70,7 +98,11 @@ class DistillationModel(nn.Module):
         self.student = LlamaLogKVForCausalLM(teacher, mode='logkv', chunk_size=chunk_size,
                                            no_level_bias=False, no_rope=no_rope,
                                            conv_kernel_size=conv_kernel_size)
-        add_lora(self.student, rank, alpha)
+        self.student.attention_training = attention_training
+        if attention_training == 'lora':
+            add_lora(self.student, rank, alpha)
+        else:
+            add_full_attention(self.student)
         for attention in self.student.attentions:
             attention.core.recompute_attention = False  # outer layer checkpoint handles it
         self.loss_chunk_tokens = loss_chunk_tokens
@@ -139,7 +171,7 @@ class DistillationModel(nn.Module):
 
 
 def student_from_checkpoint(source, path, *, model_id, model_revision, chunk_size=4):
-    """Restore student architecture and LoRA/conv weights, leaving the base intact."""
+    """Restore LoRA or full attention and optional conv, leaving the base intact."""
     import json
     from pathlib import Path
     from .inference import file_hash
@@ -154,6 +186,7 @@ def student_from_checkpoint(source, path, *, model_id, model_revision, chunk_siz
         raise ValueError('Adapter checksum mismatch')
     trained=DistillationModel(source,rank=config['rank'],alpha=config['alpha'],chunk_size=chunk_size,
                              no_rope=config.get('no_rope',False),
-                             conv_kernel_size=config.get('conv_kernel_size',0))
+                             conv_kernel_size=config.get('conv_kernel_size',0),
+                             attention_training=config.get('attention_training','lora'))
     load_adapter(trained.student,torch.load(path/'adapter.pt',map_location='cpu',weights_only=True))
     return trained.student.eval()

@@ -76,7 +76,7 @@ def main() -> None:
                             ("evaluate-initial", "Compare original and untrained LogKV")):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--device", default="cuda:0")
-        command.add_argument("--adapter", type=Path, help="Distilled LoRA checkpoint directory")
+        command.add_argument("--adapter", type=Path, help="Distilled student checkpoint (LoRA or full attention)")
         command.add_argument("--chunk-size", type=int, default=4)
         command.add_argument("--prefill-chunk-size", type=int, default=128)
         command.add_argument("--max-new-tokens", type=int, default=512)

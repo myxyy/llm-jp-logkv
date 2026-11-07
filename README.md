@@ -7,6 +7,8 @@ LogKV に置換し、蒸留・追加学習による適応を検証するプロ�
 LogKVに変更する独立推論APIとCLI、および固定減衰LogKVのLoRA蒸留を実装しています。
 蒸留時には `--no-rope` で生徒のRoPEを無効化し、`--conv-kernel-size 4` で
 各層のAttention前に元LogKVと同じCausalConvを追加できます。
+Attentionの学習方式は `--attention-training lora`（既定）または `full` を選択できます。
+`full` はQ/K/V/Oの全重みを直接更新し、FFNなどの共有部分と教師は凍結します。
 TransformersのCache/model.generateへの組み込みは未対応で、独自の生成処理を使用します。
 初期評価では元モデルが4問とも正答した一方、未蒸留LogKVの両条件は反復出力となりました。
 [実重みでの初期品質・性能結果](doc/initial-quality-20261102.md)を参照してください。
@@ -143,7 +145,7 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked python scripts/chat_server.p
 
 ブラウザで `http://127.0.0.1:8000` を開く。`--run-name` 指定時の
 `--checkpoint` の既定値は `latest`。step名の指定も可能で、起動後の自動切替は行わない。
-固定revisionの元モデル重みとcheckpointのLoRAを読み込み、model revisionとadapterの
+固定revisionの元モデル重みとcheckpointの学習済みAttentionを読み込み、model revisionとadapterの
 hashを検査する。LoRA rank・alpha・LogKV chunk size・RoPE・CausalConvはcheckpointの
 設定を使用し、有効な場合は畳み込みの学習済み重みと正規化重みも読み込む。
 会話中はLogKV状態に加えて畳み込みの直近kernel size−1 tokensの履歴も保持する。
@@ -195,8 +197,10 @@ GQA・生成キャッシュ・LoRA の勾配を CPU で確認します。8B モ�
 ## 固定減衰LogKVの蒸留
 
 `scripts/run_distillation.py` はtorchrunによるDDP訓練を管理し、終了コードを保存します。
-教師の全重みと生徒の元Llama部分を固定し、全32層のQ/K/V/Oに追加したLoRAを
-全語彙KL + next-token CEで学習します。CausalConvを有効にした場合は、その追加重みも
+教師の全重みと生徒のembedding・FFN・既存RMSNorm・LM headを固定し、既定では全32層の
+Q/K/V/Oに追加したLoRAを全語彙KL + next-token CEで学習します。
+`--attention-training full` ではQ/K/V/O本体を教師から独立した重みとして学習します。
+CausalConvを有効にした場合は、その追加重みも
 学習します。BF16、層checkpoint、語彙損失の分割を用い、
 一定stepごとに生成全文・token IDs・検証損失・再開可能なcheckpointを記録します。
 
@@ -248,6 +252,17 @@ RoPEなし・CausalConvありで新規蒸留する場合は、別のrun名で次
 チャットや `infer --adapter`、終了後の評価はcheckpointの構成を自動復元します。
 オプションのない旧checkpointも引き続き使用できます。詳細と検証結果は
 [構成の切り替え](doc/distillation-20261102.md#ropeとcausalconvの切り替え2026-11-08)を参照してください。
+
+AttentionをLoRAではなく直接学習する場合は、新しいrunで **`--attention-training full`** を
+追加します。`--no-rope --conv-kernel-size 4` と併用できます。FFNは引き続き凍結し、
+`--rank` / `--alpha` は使いません。再開時も `--attention-training full` を指定し、
+推論・チャットではcheckpointから学習方式を自動復元します。LoRAとfullの間での再開は拒否します。
+
+fullは大容量GPU向けです。現状のDDPでは各GPUにBF16教師約16 GiBとFP32 Attentionの
+重み・勾配・Adam状態20 GiBが必要で、中間値・通信領域を除いても約36 GiBになります。
+**RTX 3090（24 GiB）には収まらず、GPU台数を増やしても1台あたりの使用量は減りません。**
+CPU offloadやモデル・optimizerの分割は未実装です。
+[fullの条件・保存容量・検証](doc/distillation-20261102.md#attentionの全パラメータ学習2026-11-08)を参照してください。
 
 `--run-dir`・`--log-dir` は廃止しました。保存先は `.env` の設定とrun名から自動決定します。
 ログは `logs/RUN/training.log` に追記し、checkpointは `checkpoints/RUN/step-NNNNNNN/` に保存します。

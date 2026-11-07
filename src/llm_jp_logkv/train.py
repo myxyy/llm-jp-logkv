@@ -51,8 +51,10 @@ def build_parser():
     p.add_argument('--sequence-length',type=int,default=1024)
     p.add_argument('--batch-size',type=int,default=1)
     p.add_argument('--grad-accum',type=int,default=4)
-    p.add_argument('--rank',type=int,default=32)
-    p.add_argument('--alpha',type=float,default=64.)
+    p.add_argument('--attention-training',choices=('lora','full'),default='lora',
+                   help='Train Q/K/V/O through LoRA (default) or directly; FFN stays frozen')
+    p.add_argument('--rank',type=int,default=32,help='LoRA rank (ignored with full attention training)')
+    p.add_argument('--alpha',type=float,default=64.,help='LoRA alpha (ignored with full attention training)')
     p.add_argument('--chunk-size',type=int,default=4)
     p.add_argument('--no-rope',action='store_true',help='Disable RoPE in the student only')
     p.add_argument('--conv-kernel-size',type=int,default=0,
@@ -78,8 +80,10 @@ def build_parser():
 def parse_args(argv=None, parser=None):
     p=parser or build_parser()
     args=p.parse_args(argv)
-    if min(args.sequence_length,args.batch_size,args.grad_accum,args.rank,args.loss_chunk_tokens,args.val_examples_per_rank,args.sample_max_new_tokens) < 1:
+    if min(args.sequence_length,args.batch_size,args.grad_accum,args.loss_chunk_tokens,args.val_examples_per_rank,args.sample_max_new_tokens) < 1:
         p.error('Lengths, sizes, and intervals must be positive')
+    if args.attention_training=='lora' and args.rank<1:
+        p.error('--rank must be positive for LoRA')
     if args.max_hours is not None and (not math.isfinite(args.max_hours) or args.max_hours<=0):
         p.error('--max-hours must be finite and positive; omit it for no time limit')
     if args.num_epochs<0 or args.max_steps<0:
@@ -108,18 +112,21 @@ def emit(run, name, value):
 
 
 def model_config(args):
+    lora=args.attention_training=='lora'
     return {'model_id':SETTINGS.model_id,'model_revision':SETTINGS.model_revision,
-            'rank':args.rank,'alpha':args.alpha,'chunk_size':args.chunk_size,
+            'attention_training':args.attention_training,
+            'rank':args.rank if lora else None,'alpha':args.alpha if lora else None,'chunk_size':args.chunk_size,
             'no_rope':args.no_rope,'conv_kernel_size':args.conv_kernel_size,
-            'no_level_bias':False,'dtype':'bfloat16','lora_parameter_dtype':'float32',
+            'no_level_bias':False,'dtype':'bfloat16','lora_parameter_dtype':'float32' if lora else None,
+            **({} if lora else {'full_attention_parameter_dtype':'float32'}),
             'targets':['q_proj','k_proj','v_proj','o_proj']}
 
 
 def check_model_config(saved, args):
-    # Pre-option checkpoints used RoPE with no convolution.
-    saved={'no_rope':False,'conv_kernel_size':0,**saved}
+    # Pre-option checkpoints used LoRA and RoPE with no convolution.
+    saved={'no_rope':False,'conv_kernel_size':0,'attention_training':'lora',**saved}
     if saved!=model_config(args):
-        raise ValueError('Resume adapter configuration differs (including RoPE/convolution)')
+        raise ValueError('Resume adapter configuration differs (including training mode, RoPE/convolution)')
 
 
 def training_signature(args):
@@ -389,6 +396,7 @@ def run_training(args, device, rank, world):
         raise RuntimeError('Base model weights were not loaded exactly')
     torch.manual_seed(args.seed)
     model=DistillationModel(teacher,rank=args.rank,alpha=args.alpha,chunk_size=args.chunk_size,
+        attention_training=args.attention_training,
         no_rope=args.no_rope,conv_kernel_size=args.conv_kernel_size,
         loss_chunk_tokens=args.loss_chunk_tokens,temperature=args.temperature,ce_weight=args.ce_weight)
     params=[p for p in model.parameters() if p.requires_grad]
@@ -441,7 +449,8 @@ def run_training(args, device, rank, world):
             'global_examples_per_step':world*args.batch_size*args.grad_accum,
             'batches_per_epoch_per_rank':len(loader),'optimizer_steps_per_epoch':math.ceil(len(loader)/args.grad_accum),
             'num_epochs':args.num_epochs,'max_hours':args.max_hours,
-            'grouped_forward':True,'lora_only':not bool(args.conv_kernel_size),
+            'grouped_forward':True,'lora_only':args.attention_training=='lora' and not bool(args.conv_kernel_size),
+            'attention_training':args.attention_training,'trainable_attention_parameter_dtype':'float32',
             'conv_kernel_size':args.conv_kernel_size,'no_rope':args.no_rope,
             'conv_parameter_dtype':'float32' if args.conv_kernel_size else None,
             'frozen_teacher':True})

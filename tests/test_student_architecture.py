@@ -23,9 +23,10 @@ def test_flags_forwarding_validation_and_legacy_resume():
     defaults = args_for()
     assert not defaults.no_rope and defaults.conv_kernel_size == 0
     legacy = train.model_config(defaults)
-    del legacy['no_rope'], legacy['conv_kernel_size']
+    del legacy['no_rope'], legacy['conv_kernel_size'], legacy['attention_training']
     train.check_model_config(legacy, defaults)
     for flags in (['--no-rope'], ['--conv-kernel-size', '4'],
+                  ['--attention-training', 'full'],
                   ['--no-rope', '--conv-kernel-size', '4']):
         args = args_for(*flags)
         forwarded = train.parse_args(training_launcher.trainer_arguments(args))
@@ -113,16 +114,20 @@ def test_conv_matches_unmodified_upstream_forward_step_and_gradients():
         torch.testing.assert_close(p.grad.double(), r.grad, atol=1e-6, rtol=1e-6)
 
 
-@pytest.mark.parametrize('legacy,no_rope,kernel', [(True, False, 0), (False, True, 0),
-                                                 (False, False, 4), (False, True, 4)])
+@pytest.mark.parametrize('legacy,no_rope,kernel,training', [
+    (True, False, 0, 'lora'), (False, True, 0, 'lora'),
+    (False, False, 4, 'lora'), (False, True, 4, 'lora'),
+    (False, False, 0, 'full'), (False, True, 0, 'full'),
+    (False, False, 4, 'full'), (False, True, 4, 'full')])
 @torch.no_grad()
-def test_checkpoint_restores_architecture_and_all_weights(tmp_path, legacy, no_rope, kernel):
-    args = args_for(*(['--no-rope'] if no_rope else []), '--conv-kernel-size', str(kernel))
+def test_checkpoint_restores_architecture_and_all_weights(tmp_path, legacy, no_rope, kernel, training):
+    args = args_for(*(['--no-rope'] if no_rope else []), '--conv-kernel-size', str(kernel),
+                    '--attention-training', training, '--rank', '2', '--alpha', '4')
     config = train.model_config(args)
-    config.update(rank=2, alpha=4)
     if legacy:
-        del config['no_rope'], config['conv_kernel_size']
-    model = DistillationModel(tiny(), rank=2, alpha=4, no_rope=no_rope, conv_kernel_size=kernel)
+        del config['no_rope'], config['conv_kernel_size'], config['attention_training']
+    model = DistillationModel(tiny(), rank=2, alpha=4, no_rope=no_rope, conv_kernel_size=kernel,
+                              attention_training=training)
     for p in model.student.parameters():
         if p.requires_grad:
             p.add_(torch.randn_like(p)*.01)
@@ -132,6 +137,7 @@ def test_checkpoint_restores_architecture_and_all_weights(tmp_path, legacy, no_r
     restored = student_from_checkpoint(tiny(), tmp_path, model_id=config['model_id'],
                                        model_revision=config['model_revision'])
     assert (restored.no_rope, restored.conv_kernel_size) == (no_rope, kernel)
+    assert restored.attention_training == training
     ids = torch.tensor([[1, 9, 8, 7, 2]])
     torch.testing.assert_close(restored(ids)[0], model.student(ids)[0], atol=0, rtol=0)
     assert adapter_state(restored).keys() == adapter_state(model.student).keys()

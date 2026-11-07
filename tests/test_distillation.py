@@ -35,12 +35,14 @@ def test_grouped_adapter_output_and_gradients_match_streaming_path():
 
 
 @pytest.mark.parametrize('no_rope,conv_kernel_size', [(False, 0), (True, 0), (False, 4), (True, 4)])
-def test_training_changes_only_student_lora_and_roundtrips_adapter(no_rope, conv_kernel_size):
+@pytest.mark.parametrize('attention_training', ['lora', 'full'])
+def test_training_changes_only_student_and_roundtrips_adapter(no_rope, conv_kernel_size, attention_training):
     source = tiny()
     ids = torch.tensor([[1,4,5,9,10,8,7,6,2]])
     expected_teacher = source(ids).logits.detach().clone()
     options = dict(no_rope=no_rope, conv_kernel_size=conv_kernel_size)
     initial_student = LlamaLogKVForCausalLM(source, **options)(ids)[0].detach()
+    options['attention_training'] = attention_training
     train = DistillationModel(source, rank=2, alpha=4, loss_chunk_tokens=3, **options)
     if not conv_kernel_size:  # Added convolutions have upstream random initialization.
         torch.testing.assert_close(train.student(ids)[0], initial_student, atol=0,rtol=0)
@@ -54,6 +56,11 @@ def test_training_changes_only_student_lora_and_roundtrips_adapter(no_rope, conv
         optimizer.step(); optimizer.zero_grad(set_to_none=True)
     after = adapter_state(train.student)
     assert any(not torch.equal(before[k],after[k]) for k in before)
+    if attention_training == 'full':
+        assert not any('lora_' in name for name in before)
+        attention_names = [k for k in before if k.startswith('attentions.')]
+        assert len(attention_names) == 12  # All four matrices in every layer.
+        assert all(not torch.equal(before[k], after[k]) for k in attention_names)
     if conv_kernel_size:
         conv_names = [k for k in before if k.startswith('causal_convs.')]
         assert len(conv_names) == 9  # RMSNorm weight + convolution weight/bias, per layer.
@@ -68,10 +75,12 @@ def test_training_changes_only_student_lora_and_roundtrips_adapter(no_rope, conv
 
 @pytest.mark.parametrize('dtype', [torch.float64, torch.bfloat16])
 @pytest.mark.parametrize('no_rope,conv_kernel_size', [(False, 0), (True, 0), (False, 4), (True, 4)])
+@pytest.mark.parametrize('attention_training', ['lora', 'full'])
 @torch.no_grad()
-def test_lora_grouped_full_model_matches_streaming_inference(dtype, no_rope, conv_kernel_size):
+def test_grouped_full_model_matches_streaming_inference(dtype, no_rope, conv_kernel_size, attention_training):
     model = DistillationModel(tiny().to(dtype), rank=2, alpha=4,
-                              no_rope=no_rope, conv_kernel_size=conv_kernel_size)
+                              no_rope=no_rope, conv_kernel_size=conv_kernel_size,
+                              attention_training=attention_training)
     for name, p in model.student.named_parameters():
         if 'lora_B' in name:
             p.normal_(std=.02)
@@ -85,13 +94,16 @@ def test_lora_grouped_full_model_matches_streaming_inference(dtype, no_rope, con
 
 
 @pytest.mark.parametrize('conv_kernel_size', [0, 4])
-def test_chunked_full_vocab_loss_checkpointing_and_padding_gradients(conv_kernel_size):
+@pytest.mark.parametrize('attention_training', ['lora', 'full'])
+def test_chunked_full_vocab_loss_checkpointing_and_padding_gradients(conv_kernel_size, attention_training):
     ids = torch.tensor([[1,4,5,9,10,8,7,6,2],[1,9,7,2,0,0,0,0,0]])
     lengths = torch.tensor([9,4])
     torch.manual_seed(33)
     a = DistillationModel(tiny(),rank=2,alpha=4,loss_chunk_tokens=3,checkpoint_layers=True,
+                         attention_training=attention_training,
                          conv_kernel_size=conv_kernel_size, no_rope=bool(conv_kernel_size))
     b = DistillationModel(tiny(),rank=2,alpha=4,loss_chunk_tokens=100,checkpoint_layers=False,
+                         attention_training=attention_training,
                          conv_kernel_size=conv_kernel_size, no_rope=bool(conv_kernel_size))
     load_adapter(b.student,adapter_state(a.student))
     la,sa=a(ids,lengths); lb,sb=b(ids,lengths)

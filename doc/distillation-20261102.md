@@ -235,6 +235,63 @@ optimizer状態の復元を確認した。この小型GPU検証でgrouped/stream
 記録はRAIDの `logs/architecture-cuda-20261108-01/`（検証スクリプト・出力・結果・小型checkpoint）と
 `logs/architecture-full-tests-20261108-01/`。新構成による8Bモデルの蒸留・長期出力の安定性は未検証。
 
+### Attentionの全パラメータ学習（2026-11-08）
+
+`--attention-training` で `lora`（従来どおり・既定）と `full` を選択できる。
+fullは全32層のQ/K/V/Oの全要素を学習する。元重みから独立コピーで初期化し、
+教師のAttentionと共有しない。FP32のmaster重みを持ち、演算時は入力dtypeへcastする。
+教師の全重み、生徒のFFN・embedding・既存RMSNorm・LM headは引き続き凍結する。
+`--no-rope` と併用可能で、`--conv-kernel-size N` が有効なら追加CausalConvも学習する。
+
+fullでは `--rank` / `--alpha` は無視し、checkpointの対応フィールドをnullにする。
+`config.json` の `attention_training` は再開時に一致を検査する。
+このキーがない旧checkpointはloraとして扱う。LoRAからfull、fullからLoRAへの再開は
+拒否するため、学習方式を変更するときは新しいrun名で開始する。
+
+**現状のDDPで8Bモデルをfull訓練するには、1台ごとに大容量GPUが必要。**
+固定revisionのモデル構成から計数すると以下になる（activation・通信・一時領域を除く理論値）。
+
+| 項目 | 容量・個数 |
+|---|---:|
+| 凍結教師全体 | 8,590,200,832 parameters / BF16 約16.0005 GiB |
+| 生徒の全Q/K/V/O | 1,342,177,280 parameters |
+| 学習するAttentionのFP32重み＋勾配＋Adamの2状態 | 20 GiB |
+| 合計の下限 | 約36.0005 GiB / GPU |
+| fullのadapter.pt（畳み込みなし・tensor本体） | 約5 GiB |
+| fullのtraining_state.pt中のAdam状態（tensor本体） | 約10 GiB |
+
+DDPは各GPUにモデルとoptimizerを複製する。RTX 3090の24 GiBでは不足し、
+6 GPUへ増やしても解消しない。CPU offloadやパラメータ・optimizerの分割は未実装。
+checkpointは1個あたり約15 GiB＋metadataとなり、既定の2個保持では約30 GiB。
+新規保存の完了後に古いものを削除するため、保存中はさらに1個分の空き領域が必要。
+hash計算は大きいファイル全体をRAMに読み込まず、ストリームで計算する。
+
+十分なVRAMを持つGPUでの起動例（2 GPU、時間制限なし・1 epoch）:
+
+```bash
+./scripts/uv.sh run --locked python scripts/run_distillation.py \
+  --run-name distill-full-no-rope-conv4 --gpus 0,1 --evaluate-final \
+  --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-all-reasoning-20261103-100k \
+  --batch-size 1 --grad-accum 12 \
+  --attention-training full --no-rope --conv-kernel-size 4
+```
+
+再開は同じ引数に `--resume latest` を追加する。`adapter.pt` という既存のファイル名を維持し、
+中身にはQ/K/V/Oの全重みと有効な場合のCausalConv全重みを保存する。
+optimizer・RNG・データ位置の保存形式も維持する。チャット、`infer --adapter`、
+`evaluate-initial --adapter`、終了後の評価は保存された学習方式を自動復元する。
+教師・FFNなどの凍結部分は従来どおり固定revisionからロードする。
+
+検証: CPU **357 passed in 17.52s**。全層Q/K/V/Oの更新と凍結部分の値・勾配、
+教師との非共有、RoPE/CausalConvとの組合せ、FP64/BF16のgrouped/streaming、
+activation checkpoint・padding、旧LoRA互換、学習方式不一致の拒否を確認した。
+実際の保存関数を使い、全Attention・optimizerを復元した次の更新が継続実行と完全一致した。
+RTX 3090 2台の小型3層モデルでも、full＋conv4、RoPEあり/なしを各2 steps実行し、
+BF16・DDP・fused AdamWで全勾配が有限、rank間の重みhash一致、教師重み不変、
+保存復元後のlogits完全一致、optimizer状態復元を確認した。
+記録はRAIDの `logs/full-attention-cuda-20261108-01/` と
+`logs/full-attention-full-tests-20261108-01/`。8Bモデルのfull訓練・品質評価は実施していない。
+
 ### ログ・保存先の確認
 
 supervisorはtorchrunの終了コードを保存する。`--evaluate-final` 指定時には通常終了後に

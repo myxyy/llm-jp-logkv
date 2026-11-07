@@ -1,6 +1,6 @@
-"""Local inference and recorded comparisons, optionally loading distilled LoRA."""
+"""Local inference and recorded comparisons with optional distilled student weights."""
 from datetime import datetime, timezone
-from hashlib import sha256
+from hashlib import file_digest
 from importlib.metadata import version
 import math
 import os
@@ -28,7 +28,9 @@ def new_run(settings, kind):
 
 
 def file_hash(path):
-    return sha256(Path(path).read_bytes()).hexdigest()
+    # Full-attention checkpoints can be many GiB; bound checksum memory use.
+    with Path(path).open('rb') as stream:
+        return file_digest(stream, 'sha256').hexdigest()
 
 
 def provenance(settings, args):
@@ -58,6 +60,7 @@ def provenance(settings, args):
         'device': args.device, 'dtype': 'bfloat16',
         'gpu': torch.cuda.get_device_name(args.device) if args.device.startswith('cuda') else None,
         'attention': {'all_layers': True, 'chunk_size': args.chunk_size,
+                      'training_mode': adapter_config.get('attention_training', 'lora') if adapter_config else None,
                       'self_slot': True,
                       'rope': ('disabled' if adapter_config.get('no_rope', False)
                                else 'original, applied once before pooling'),
