@@ -59,7 +59,7 @@ def load_adapter(student, state):
 class DistillationModel(nn.Module):
     def __init__(self, teacher, *, rank=32, alpha=64, chunk_size=4,
                  loss_chunk_tokens=64, temperature=1., ce_weight=.1,
-                 checkpoint_layers=True):
+                 checkpoint_layers=True, no_rope=False, conv_kernel_size=0):
         super().__init__()
         if temperature <= 0 or ce_weight < 0 or loss_chunk_tokens <= 0:
             raise ValueError('Invalid loss settings')
@@ -68,7 +68,8 @@ class DistillationModel(nn.Module):
         # Do not register a second alias of the whole teacher in this module.
         object.__setattr__(self, 'teacher', teacher)
         self.student = LlamaLogKVForCausalLM(teacher, mode='logkv', chunk_size=chunk_size,
-                                           no_level_bias=False)
+                                           no_level_bias=False, no_rope=no_rope,
+                                           conv_kernel_size=conv_kernel_size)
         add_lora(self.student, rank, alpha)
         for attention in self.student.attentions:
             attention.core.recompute_attention = False  # outer layer checkpoint handles it
@@ -78,13 +79,15 @@ class DistillationModel(nn.Module):
 
     def _block(self, index, hidden, cos, sin):
         layer, attention = self.student.layers[index], self.student.attentions[index]
+        if self.student.conv_kernel_size:
+            hidden = self.student.causal_convs[index](hidden)
         hidden = hidden + attention.forward_full(layer.input_layernorm(hidden), (cos, sin))
         return hidden + layer.mlp(layer.post_attention_layernorm(hidden))
 
     def student_hidden(self, input_ids):
         hidden = self.student.embed_tokens(input_ids)
         pos = torch.arange(input_ids.shape[1], device=hidden.device)[None]
-        cos, sin = self.student.rotary_emb(hidden, pos)
+        cos, sin = self.student.position_embeddings(hidden, pos)
         for index in range(len(self.student.layers)):
             if self.checkpoint_layers and torch.is_grad_enabled():
                 hidden = checkpoint(partial(self._block, index), hidden, cos, sin,
@@ -136,7 +139,7 @@ class DistillationModel(nn.Module):
 
 
 def student_from_checkpoint(source, path, *, model_id, model_revision, chunk_size=4):
-    """Load only LoRA weights; never replace or merge into the frozen base."""
+    """Restore student architecture and LoRA/conv weights, leaving the base intact."""
     import json
     from pathlib import Path
     from .inference import file_hash
@@ -149,6 +152,8 @@ def student_from_checkpoint(source, path, *, model_id, model_revision, chunk_siz
         raise ValueError('Checkpoint attention configuration differs')
     if file_hash(path/'adapter.pt')!=complete['adapter_sha256']:
         raise ValueError('Adapter checksum mismatch')
-    trained=DistillationModel(source,rank=config['rank'],alpha=config['alpha'],chunk_size=chunk_size)
+    trained=DistillationModel(source,rank=config['rank'],alpha=config['alpha'],chunk_size=chunk_size,
+                             no_rope=config.get('no_rope',False),
+                             conv_kernel_size=config.get('conv_kernel_size',0))
     load_adapter(trained.student,torch.load(path/'adapter.pt',map_location='cpu',weights_only=True))
     return trained.student.eval()

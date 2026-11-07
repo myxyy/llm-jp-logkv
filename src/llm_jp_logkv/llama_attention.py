@@ -22,17 +22,20 @@ class LlamaAttentionAdapter(nn.Module):
     """Unpadded causal attention with explicit, caller-owned streaming state.
 
     Reuses the source projections by identity. RoPE is supplied by the original
-    Llama rotary module using positions starting at state.offset. No conv/gate,
-    normalization or extra positional transform is introduced.
+    Llama rotary module using positions starting at state.offset, unless disabled.
+    No conv/gate, normalization or extra positional transform is introduced
+    inside attention; optional convolution belongs to the enclosing model block.
     """
 
-    def __init__(self, source, *, mode="dense", chunk_size=4, no_level_bias=False):
+    def __init__(self, source, *, mode="dense", chunk_size=4, no_level_bias=False,
+                 no_rope=False):
         super().__init__()
         if mode not in ("dense", "logkv"):
             raise ValueError("mode must be dense or logkv")
         if source.attention_dropout != 0:
             raise ValueError("Only zero attention dropout is supported")
         self.mode = mode
+        self.no_rope = no_rope
         self.head_dim = source.head_dim
         self.heads = source.config.num_attention_heads
         self.groups = source.num_key_value_groups
@@ -85,7 +88,8 @@ class LlamaAttentionAdapter(nn.Module):
         shape = (batch, length, -1, self.head_dim)
         q, k, v = [proj(hidden_states).view(shape).transpose(1, 2)
                    for proj in (self.q_proj, self.k_proj, self.v_proj)]
-        q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
+        if not self.no_rope:
+            q, k = apply_rotary_pos_emb(q, k, *position_embeddings)
         return q, k, v
 
     def forward_full(self, hidden_states, position_embeddings):

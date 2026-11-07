@@ -33,6 +33,8 @@ def file_hash(path):
 
 def provenance(settings, args):
     root = Path(__file__).resolve().parents[2]
+    adapter_config = (json.loads((args.adapter/'config.json').read_text())
+                      if getattr(args, 'adapter', None) else {})
     def git(*words):
         return subprocess.check_output(['git', '-C', str(root), *words], text=True).strip()
     return {
@@ -51,12 +53,17 @@ def provenance(settings, args):
         'uses_distilled_adapter': bool(getattr(args, 'adapter', None)),
         'adapter_checkpoint': str(args.adapter) if getattr(args, 'adapter', None) else None,
         'adapter_sha256': file_hash(args.adapter / 'adapter.pt') if getattr(args, 'adapter', None) else None,
+        'adapter_config': adapter_config or None,
         'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
         'device': args.device, 'dtype': 'bfloat16',
         'gpu': torch.cuda.get_device_name(args.device) if args.device.startswith('cuda') else None,
         'attention': {'all_layers': True, 'chunk_size': args.chunk_size,
-                      'self_slot': True, 'rope': 'original, applied once before pooling',
-                      'compressed_cache_heads': 32, 'extra_conv_gate_norm': False},
+                      'self_slot': True,
+                      'rope': ('disabled' if adapter_config.get('no_rope', False)
+                               else 'original, applied once before pooling'),
+                      'conv_kernel_size': adapter_config.get('conv_kernel_size', 0),
+                      'conv_parameter_dtype': 'float32' if adapter_config.get('conv_kernel_size', 0) else None,
+                      'compressed_cache_heads': 32},
     }
 
 

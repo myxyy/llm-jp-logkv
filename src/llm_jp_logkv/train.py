@@ -54,6 +54,9 @@ def build_parser():
     p.add_argument('--rank',type=int,default=32)
     p.add_argument('--alpha',type=float,default=64.)
     p.add_argument('--chunk-size',type=int,default=4)
+    p.add_argument('--no-rope',action='store_true',help='Disable RoPE in the student only')
+    p.add_argument('--conv-kernel-size',type=int,default=0,
+                   help='Student causal convolution kernel size (0: disabled; upstream: 4)')
     p.add_argument('--loss-chunk-tokens',type=int,default=512)
     p.add_argument('--temperature',type=float,default=1.)
     p.add_argument('--ce-weight',type=float,default=.1)
@@ -85,6 +88,8 @@ def parse_args(argv=None, parser=None):
         p.error('--num-epochs 0 requires --max-hours or --max-steps')
     if args.max_checkpoints<1:
         p.error('--max-checkpoints must be >=1')
+    if args.conv_kernel_size<0:
+        p.error('--conv-kernel-size must be nonnegative (0 disables convolution)')
     if args.chunk_size < 2 or min(args.sample_every,args.save_every,args.validate_every) < 1:
         p.error('Invalid duration, chunk size, or event interval')
     try:
@@ -105,8 +110,16 @@ def emit(run, name, value):
 def model_config(args):
     return {'model_id':SETTINGS.model_id,'model_revision':SETTINGS.model_revision,
             'rank':args.rank,'alpha':args.alpha,'chunk_size':args.chunk_size,
+            'no_rope':args.no_rope,'conv_kernel_size':args.conv_kernel_size,
             'no_level_bias':False,'dtype':'bfloat16','lora_parameter_dtype':'float32',
             'targets':['q_proj','k_proj','v_proj','o_proj']}
+
+
+def check_model_config(saved, args):
+    # Pre-option checkpoints used RoPE with no convolution.
+    saved={'no_rope':False,'conv_kernel_size':0,**saved}
+    if saved!=model_config(args):
+        raise ValueError('Resume adapter configuration differs (including RoPE/convolution)')
 
 
 def training_signature(args):
@@ -376,14 +389,14 @@ def run_training(args, device, rank, world):
         raise RuntimeError('Base model weights were not loaded exactly')
     torch.manual_seed(args.seed)
     model=DistillationModel(teacher,rank=args.rank,alpha=args.alpha,chunk_size=args.chunk_size,
+        no_rope=args.no_rope,conv_kernel_size=args.conv_kernel_size,
         loss_chunk_tokens=args.loss_chunk_tokens,temperature=args.temperature,ce_weight=args.ce_weight)
     params=[p for p in model.parameters() if p.requires_grad]
     optimizer=torch.optim.AdamW(params,lr=args.lr,betas=(.9,.95),weight_decay=.01,fused=True)
     step=epoch=batch_in_epoch=0; prior_elapsed=0.
     if args.resume:
         config=json.loads((args.resume/'config.json').read_text())
-        if config!=model_config(args):
-            raise ValueError('Resume adapter configuration differs')
+        check_model_config(config,args)
         complete=json.loads((args.resume/'complete.json').read_text())
         if complete['data_manifest_sha256']!=file_hash(args.data/'manifest.json'):
             raise ValueError('Resume data differs')
@@ -428,7 +441,10 @@ def run_training(args, device, rank, world):
             'global_examples_per_step':world*args.batch_size*args.grad_accum,
             'batches_per_epoch_per_rank':len(loader),'optimizer_steps_per_epoch':math.ceil(len(loader)/args.grad_accum),
             'num_epochs':args.num_epochs,'max_hours':args.max_hours,
-            'grouped_forward':True,'lora_only':True,'frozen_teacher':True})
+            'grouped_forward':True,'lora_only':not bool(args.conv_kernel_size),
+            'conv_kernel_size':args.conv_kernel_size,'no_rope':args.no_rope,
+            'conv_parameter_dtype':'float32' if args.conv_kernel_size else None,
+            'frozen_teacher':True})
     dist.barrier()
     started=time.monotonic()
     if not args.resume:

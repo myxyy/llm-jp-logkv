@@ -1,5 +1,11 @@
 # 最小Llama Attentionアダプター（2026-11-01）
 
+以下は初期実装と検証の記録。2026-11-08に、生徒のRoPEを無効化する `--no-rope` と、
+モデルの各層にCausalConvを追加する `--conv-kernel-size` を実装した。
+省略時は以下の既存構成を維持する。追加ブロックはAttention adapterの外側に置き、
+参照コアは変更していない。仕様・コマンド・検証は
+[蒸留実験記録](distillation-20261102.md#ropeとcausalconvの切り替え2026-11-08)を参照。
+
 ## 決定した仕様
 
 `LlamaAttentionAdapter(source, mode="dense" | "logkv", chunk_size=4,

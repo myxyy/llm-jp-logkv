@@ -161,16 +161,17 @@ def test_alternate_model_eos_is_not_part_of_answer_text():
     assert turn.result_state.tokens[-2:] == (12, 4)
 
 
-def tiny_model():
+def tiny_model(**options):
     torch.manual_seed(29)
     config = LlamaConfig(vocab_size=64, hidden_size=16, intermediate_size=24,
                         num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
                         head_dim=8, max_position_embeddings=8, eos_token_id=[5])
-    return LlamaLogKVForCausalLM(LlamaForCausalLM(config).double().eval())
+    return LlamaLogKVForCausalLM(LlamaForCausalLM(config).double().eval(), **options)
 
 
-def test_cached_real_logkv_matches_continuous_tokens_beyond_original_context(monkeypatch):
-    model = tiny_model()
+@pytest.mark.parametrize('options', [{}, {'no_rope': True, 'conv_kernel_size': 4}])
+def test_cached_real_logkv_matches_continuous_tokens_beyond_original_context(monkeypatch, options):
+    model = tiny_model(**options)
     chat = engine(model)
     sequence = ScriptedModel.sequence
     samples = iter(sequence * 2)
@@ -188,6 +189,8 @@ def test_cached_real_logkv_matches_continuous_tokens_beyond_original_context(mon
         expected_logits, _ = model(torch.tensor([[32]]), expected, logits_to_keep=1)
     assert actual.offset == all_ids.shape[1] + 1
     torch.testing.assert_close(actual_logits, expected_logits, atol=1e-10, rtol=1e-10)
+    for a, b in zip(second.result_state.conv_caches, expected.conv_caches):
+        torch.testing.assert_close(a, b, atol=1e-10, rtol=1e-10)
     for a, b in zip(second.result_state.layers, expected.layers):
         assert a.offset == b.offset
         for level_a, level_b in zip(a.payload[0], b.payload[0]):

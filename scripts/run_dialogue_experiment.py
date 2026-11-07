@@ -114,6 +114,7 @@ def main():
         payload = {'offset': offset, 'turn': index, 'effort': session.effort,
                    'total_input_tokens': total_input, 'total_output_tokens': total_output,
                    'adapter_sha256': manifest['adapter_sha256'],
+                   'conv_caches': cpu_tree(session.state.conv_caches),
                    'layers': [{'mode': s.mode, 'offset': s.offset, 'payload': cpu_tree(s.payload)}
                               for s in session.state.layers],
                    'cpu_rng': torch.get_rng_state(), 'cuda_rng': torch.cuda.get_rng_state_all()}

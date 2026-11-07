@@ -81,6 +81,7 @@ def launch(args):
             else:
                 with (records/'final-evaluation.log').open('x') as log:
                     code = subprocess.run(['llm-jp-logkv', 'evaluate-initial', '--adapter', completed['checkpoint'],
+                           '--chunk-size', str(args.chunk_size),
                            '--max-new-tokens', str(args.evaluation_max_new_tokens)],
                            env={**env, 'CUDA_VISIBLE_DEVICES':args.gpus.split(',')[0]},
                            stdout=log, stderr=subprocess.STDOUT).returncode

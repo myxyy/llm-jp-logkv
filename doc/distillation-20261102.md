@@ -180,6 +180,61 @@ distill_root=/mnt/raid0/llm-jp-logkv
 既存runで再開できるのはそのrunの最新checkpointのみ。古いstepから分岐する場合は
 新しいrun名と元checkpointのパスを指定する。同じrunの二重起動はロックで拒否する。
 
+### RoPEとCausalConvの切り替え（2026-11-08）
+
+生徒モデルの構成を次の引数で変更できる。両方とも単独でも使用可能。
+この文書冒頭の8時間試行と既存の `distill-20261102` / `distill-20261103` は、
+RoPEあり・CausalConvなしで学習した結果であり、新構成の品質評価ではない。
+
+| 引数 | 省略時 | 指定時 |
+|---|---|---|
+| `--no-rope` | 生徒にも元LlamaのRoPEを適用 | 生徒の全層でQ/K回転とrotary embedding計算を省略 |
+| `--conv-kernel-size N` | 0（無効） | N≥1で各層にCausalConvを追加。元LogKVの訓練CLIはN=4 |
+
+元LogKVの構成に近づける新規蒸留例（2 GPU、global batch=24、時間制限なし・1 epoch）:
+
+```bash
+./scripts/uv.sh run --locked python scripts/run_distillation.py \
+  --run-name distill-no-rope-conv4 --gpus 0,1 --evaluate-final \
+  --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-all-reasoning-20261103-100k \
+  --batch-size 1 --grad-accum 12 --no-rope --conv-kernel-size 4
+```
+
+中断後は同じコマンドに `--resume latest` を追加し、`--no-rope --conv-kernel-size 4` も
+維持する。旧構成のcheckpointにこの指定を追加して再開することはできない。
+新構成は新しいrun名で学習を開始する。旧checkpointでは未記録の設定を
+`no_rope=false` / `conv_kernel_size=0` と扱い、従来どおり再開・推論できる。
+
+CausalConvは無改変の参照コア `CausalConvBlock` を流用する。
+各層で **CausalConv残差 → LlamaのAttention残差 → LlamaのFFN残差** の順に適用する。
+ブロック内部はRMSNorm → depthwise causal Conv1d → SiLU → 残差加算で、
+上位の再帰圧縮レベルには畳み込みを追加しない。系列の開始のみゼロ埋めし、
+推論時は各層の正規化済み入力を直近N−1 tokens保持する。prefill分割・生成・会話ターンを
+またいで同じ履歴を使い、既存の状態を変更せずに新しい状態を返す。
+
+畳み込みは元実装と同じランダム初期化（RMSNorm重みは1）で追加し、LoRAとともに学習する。
+畳み込み・追加RMSNormのmaster重みはFP32、演算時は入力dtypeへ微分可能なcastを行う。
+N=4では追加パラメータは786,432個（32層×4,096次元×6）、LoRAとの合計28,049,408個。
+教師のRoPE・重み、元Llamaのembedding・RMSNorm・FFN・LM head、tokenizer・chat templateは
+維持する。Llama由来の構成と32 Qヘッド状態は残るため、元LogKV全体と同一のモデルにはならない。
+
+`config.json` に `no_rope` / `conv_kernel_size`、`adapter.pt` にLoRAと追加ブロックの全重みを
+保存する。optimizer状態も追加パラメータを含む。チャット・`infer --adapter`・
+`evaluate-initial --adapter`・`--evaluate-final` は保存構成を自動復元する。
+チャットの保持状態と状態bytesには畳み込み履歴も含む。対話実験runnerの状態保存にも
+`conv_caches` を含める。推論manifestには実際のcheckpoint構成を記録する。
+
+検証: CPU **334 passed in 15.96s**。RoPE有無×畳み込み有無、FP64/BF16のgrouped/streaming、
+勾配・activation checkpoint・padding、旧checkpoint互換、設定不一致拒否、会話の状態引継ぎを確認。
+FP64の経路一致はatol/rtol=1e-12、小型BF16モデルはatol/rtol=0.02。
+追加でRTX 3090を2台使い、小型3層モデルのBF16・DDP・fused AdamWを2 stepsずつ実行した。
+RoPEあり/なしの両条件で全勾配が有限、rank間の学習重みhash一致、保存復元後のlogits完全一致、
+optimizer状態の復元を確認した。この小型GPU検証でgrouped/streaming差は最大0だった。
+参照コアのSHA-256は `UPSTREAM.json` と一致している。
+
+記録はRAIDの `logs/architecture-cuda-20261108-01/`（検証スクリプト・出力・結果・小型checkpoint）と
+`logs/architecture-full-tests-20261108-01/`。新構成による8Bモデルの蒸留・長期出力の安定性は未検証。
+
 ### ログ・保存先の確認
 
 supervisorはtorchrunの終了コードを保存する。`--evaluate-final` 指定時には通常終了後に

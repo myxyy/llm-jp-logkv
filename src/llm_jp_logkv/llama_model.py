@@ -9,12 +9,14 @@ import torch
 from torch import nn
 
 from .llama_attention import AttentionState, LlamaAttentionAdapter
+from .llama_convolution import LlamaCausalConv
 
 
 @dataclass(frozen=True)
 class ModelState:
     layers: tuple[AttentionState, ...]
     offset: int
+    conv_caches: tuple[torch.Tensor, ...] = ()
 
     @property
     def tensor_bytes(self) -> int:
@@ -24,7 +26,7 @@ class ModelState:
             tensors = (state.payload if state.mode == 'dense'
                        else [t for level in state.payload[0] for t in level])
             total += sum(t.numel() * t.element_size() for t in tensors)
-        return total
+        return total + sum(t.numel() * t.element_size() for t in self.conv_caches)
 
 
 class LlamaLogKVForCausalLM(nn.Module):
@@ -32,12 +34,15 @@ class LlamaLogKVForCausalLM(nn.Module):
 
     All layers use the selected mode. The source model is not modified and
     weights are shared, so source and wrapper must not be trained independently.
-    Construction adds no learned parameters or quantization. Distillation can
-    subsequently wrap the student's attention projections with separate LoRA.
+    Optional causal convolutions add separate trainable parameters before each
+    attention residual. Distillation wraps attention projections with LoRA.
     """
 
-    def __init__(self, source, *, mode='logkv', chunk_size=4, no_level_bias=False):
+    def __init__(self, source, *, mode='logkv', chunk_size=4, no_level_bias=False,
+                 no_rope=False, conv_kernel_size=0):
         super().__init__()
+        if not isinstance(conv_kernel_size, int) or conv_kernel_size < 0:
+            raise ValueError('conv_kernel_size must be a nonnegative integer')
         self.config = source.config
         self.embed_tokens = source.model.embed_tokens
         self.rotary_emb = source.model.rotary_emb
@@ -46,13 +51,24 @@ class LlamaLogKVForCausalLM(nn.Module):
         self.layers = source.model.layers
         self.attentions = nn.ModuleList([
             LlamaAttentionAdapter(layer.self_attn, mode=mode, chunk_size=chunk_size,
-                                  no_level_bias=no_level_bias)
+                                  no_level_bias=no_level_bias, no_rope=no_rope)
             for layer in self.layers
         ])
         self.mode = mode
         self.chunk_size = chunk_size
         self.no_level_bias = no_level_bias
+        self.no_rope = no_rope
+        self.conv_kernel_size = conv_kernel_size
+        self.causal_convs = nn.ModuleList([
+            LlamaCausalConv(self.config.hidden_size, conv_kernel_size,
+                            device=layer.input_layernorm.weight.device)
+            for layer in self.layers
+        ] if conv_kernel_size else [])
         self.eval()
+
+    def position_embeddings(self, hidden, positions):
+        # Skip the rotary module itself as well as the Q/K rotation.
+        return (None, None) if self.no_rope else self.rotary_emb(hidden, positions)
 
     def forward(self, input_ids, state=None, *, logits_to_keep=0):
         """Return logits and new state, leaving the supplied state untouched.
@@ -69,12 +85,18 @@ class LlamaLogKVForCausalLM(nn.Module):
                 raise ValueError('Wrong number of cached layers')
             if any(s.offset != state.offset for s in state.layers):
                 raise ValueError('Inconsistent cache offsets')
+            if len(state.conv_caches) != len(self.causal_convs):
+                raise ValueError('Cached convolution configuration differs')
         offset = 0 if state is None else state.offset
         hidden = self.embed_tokens(input_ids)
         positions = torch.arange(offset, offset + input_ids.shape[1], device=hidden.device)[None]
-        rope = self.rotary_emb(hidden, positions)
-        new_states = []
+        rope = self.position_embeddings(hidden, positions)
+        new_states, conv_caches = [], []
         for i, (layer, attention) in enumerate(zip(self.layers, self.attentions)):
+            if self.conv_kernel_size:
+                hidden, cache = self.causal_convs[i](
+                    hidden, None if state is None else state.conv_caches[i], streaming=True)
+                conv_caches.append(cache)
             residual = hidden
             out, new_state = attention(layer.input_layernorm(hidden), rope,
                                        None if state is None else state.layers[i])
@@ -85,7 +107,7 @@ class LlamaLogKVForCausalLM(nn.Module):
         if logits_to_keep:
             hidden = hidden[:, -logits_to_keep:]
         logits = self.lm_head(hidden)
-        return logits, ModelState(tuple(new_states), offset + input_ids.shape[1])
+        return logits, ModelState(tuple(new_states), offset + input_ids.shape[1], tuple(conv_caches))
 
     @torch.inference_mode()
     def greedy_generate(self, input_ids, *, max_new_tokens=128, eos_token_id=None,

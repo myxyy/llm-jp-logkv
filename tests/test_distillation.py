@@ -34,13 +34,16 @@ def test_grouped_adapter_output_and_gradients_match_streaming_path():
         torch.testing.assert_close(a,b,atol=1e-11,rtol=1e-11)
 
 
-def test_training_changes_only_student_lora_and_roundtrips_adapter():
+@pytest.mark.parametrize('no_rope,conv_kernel_size', [(False, 0), (True, 0), (False, 4), (True, 4)])
+def test_training_changes_only_student_lora_and_roundtrips_adapter(no_rope, conv_kernel_size):
     source = tiny()
     ids = torch.tensor([[1,4,5,9,10,8,7,6,2]])
     expected_teacher = source(ids).logits.detach().clone()
-    initial_student = LlamaLogKVForCausalLM(source)(ids)[0].detach()
-    train = DistillationModel(source, rank=2, alpha=4, loss_chunk_tokens=3)
-    torch.testing.assert_close(train.student(ids)[0], initial_student, atol=0,rtol=0)
+    options = dict(no_rope=no_rope, conv_kernel_size=conv_kernel_size)
+    initial_student = LlamaLogKVForCausalLM(source, **options)(ids)[0].detach()
+    train = DistillationModel(source, rank=2, alpha=4, loss_chunk_tokens=3, **options)
+    if not conv_kernel_size:  # Added convolutions have upstream random initialization.
+        torch.testing.assert_close(train.student(ids)[0], initial_student, atol=0,rtol=0)
     optimizer = torch.optim.AdamW([p for p in train.parameters() if p.requires_grad], lr=.01)
     before = adapter_state(train.student)
     for _ in range(2):
@@ -51,17 +54,24 @@ def test_training_changes_only_student_lora_and_roundtrips_adapter():
         optimizer.step(); optimizer.zero_grad(set_to_none=True)
     after = adapter_state(train.student)
     assert any(not torch.equal(before[k],after[k]) for k in before)
+    if conv_kernel_size:
+        conv_names = [k for k in before if k.startswith('causal_convs.')]
+        assert len(conv_names) == 9  # RMSNorm weight + convolution weight/bias, per layer.
+        assert all(not torch.equal(before[k], after[k]) for k in conv_names)
+        assert all(after[k].dtype == torch.float32 for k in conv_names)
     assert all(p.grad is None and not p.requires_grad for p in source.parameters())
     torch.testing.assert_close(source(ids).logits, expected_teacher, atol=0,rtol=0)
-    restored = DistillationModel(tiny(),rank=2,alpha=4)
+    restored = DistillationModel(tiny(),rank=2,alpha=4,**options)
     load_adapter(restored.student, after)
     torch.testing.assert_close(restored.student(ids)[0], train.student(ids)[0],atol=0,rtol=0)
 
 
 @pytest.mark.parametrize('dtype', [torch.float64, torch.bfloat16])
+@pytest.mark.parametrize('no_rope,conv_kernel_size', [(False, 0), (True, 0), (False, 4), (True, 4)])
 @torch.no_grad()
-def test_lora_grouped_full_model_matches_streaming_inference(dtype):
-    model = DistillationModel(tiny().to(dtype), rank=2, alpha=4)
+def test_lora_grouped_full_model_matches_streaming_inference(dtype, no_rope, conv_kernel_size):
+    model = DistillationModel(tiny().to(dtype), rank=2, alpha=4,
+                              no_rope=no_rope, conv_kernel_size=conv_kernel_size)
     for name, p in model.student.named_parameters():
         if 'lora_B' in name:
             p.normal_(std=.02)
@@ -74,12 +84,15 @@ def test_lora_grouped_full_model_matches_streaming_inference(dtype):
     torch.testing.assert_close(grouped, streaming, atol=tolerance, rtol=tolerance)
 
 
-def test_chunked_full_vocab_loss_checkpointing_and_padding_gradients():
+@pytest.mark.parametrize('conv_kernel_size', [0, 4])
+def test_chunked_full_vocab_loss_checkpointing_and_padding_gradients(conv_kernel_size):
     ids = torch.tensor([[1,4,5,9,10,8,7,6,2],[1,9,7,2,0,0,0,0,0]])
     lengths = torch.tensor([9,4])
     torch.manual_seed(33)
-    a = DistillationModel(tiny(),rank=2,alpha=4,loss_chunk_tokens=3,checkpoint_layers=True)
-    b = DistillationModel(tiny(),rank=2,alpha=4,loss_chunk_tokens=100,checkpoint_layers=False)
+    a = DistillationModel(tiny(),rank=2,alpha=4,loss_chunk_tokens=3,checkpoint_layers=True,
+                         conv_kernel_size=conv_kernel_size, no_rope=bool(conv_kernel_size))
+    b = DistillationModel(tiny(),rank=2,alpha=4,loss_chunk_tokens=100,checkpoint_layers=False,
+                         conv_kernel_size=conv_kernel_size, no_rope=bool(conv_kernel_size))
     load_adapter(b.student,adapter_state(a.student))
     la,sa=a(ids,lengths); lb,sb=b(ids,lengths)
     torch.testing.assert_close(sa,sb,atol=1e-5,rtol=1e-6)
