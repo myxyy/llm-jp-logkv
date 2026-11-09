@@ -35,6 +35,13 @@ from .training_runs import (checkpoint_metadata, create_session, exclusive_run,
 BACKEND = 'remote-teacher-fsdp2-attention-v1'
 
 
+def log_progress(args, rank, event, **fields):
+    if rank == 0:
+        record = {'event': event, 'time': datetime.now(timezone.utc).isoformat(), **fields}
+        train.emit(args.session_dir, 'progress.jsonl', record)
+        print(json.dumps(record, ensure_ascii=False), flush=True)
+
+
 def build_parser():
     parser = train.build_parser()
     parser.description = __doc__
@@ -179,13 +186,21 @@ def validate(model, channel, batches, device, group):
 def record_samples(model, tokenizer, args, step, rank, group, device, phase):
     """All students take identical forwards; rank-zero tokens determine EOS/order."""
     results = []
-    for item in train.sample_prompts():
+    prompts = train.sample_prompts()
+    log_progress(args, rank, 'samples_start', step=step, phase=phase,
+                 total_samples=len(prompts), max_new_tokens=args.sample_max_new_tokens)
+    for index, item in enumerate(prompts, 1):
         ids = tokenizer.apply_chat_template([{'role': 'user', 'content': item['prompt']}],
             tokenize=True, add_generation_prompt=True, reasoning_effort='low',
             conversation_start_date='2026-11-02', return_tensors='pt', return_dict=True).input_ids.to(device)
         tick, state, generated = time.perf_counter(), None, []
+        context = {'step': step, 'phase': phase, 'sample': index,
+                   'total_samples': len(prompts), 'id': item['id']}
+        log_progress(args, rank, 'sample_start', **context, input_tokens=ids.shape[1])
         for start in range(0, ids.shape[1], 128):
             logits, state = model.student(ids[:, start:start+128], state, logits_to_keep=1)
+        log_progress(args, rank, 'sample_prefill_complete', **context,
+                     seconds=time.perf_counter()-tick)
         reason = 'length'
         eos = model.student.config.eos_token_id
         eos = set(eos if isinstance(eos, list) else [eos])
@@ -193,6 +208,9 @@ def record_samples(model, tokenizer, args, step, rank, group, device, phase):
             token = logits[:, -1].argmax(-1)
             dist.broadcast(token, src=0, group=group)
             generated.append(token.item())
+            if len(generated) == 1 or len(generated) % 16 == 0:
+                log_progress(args, rank, 'sample_progress', **context,
+                             output_tokens=len(generated), seconds=time.perf_counter()-tick)
             if token.item() in eos:
                 reason = 'eos'
                 break
@@ -201,10 +219,15 @@ def record_samples(model, tokenizer, args, step, rank, group, device, phase):
             results.append({'id': item['id'], 'prompt': item['prompt'], 'token_ids': generated,
                 'text': tokenizer.decode(generated, skip_special_tokens=False), 'stop_reason': reason,
                 'input_tokens': ids.shape[1], 'output_tokens': len(generated), 'seconds': time.perf_counter()-tick})
-    if rank == 0:
-        path = args.session_dir/'samples'/f'{phase}-step-{step:07d}.json'
-        write_json(path, {'step': step, 'phase': phase, 'samples': results})
+            path = args.session_dir/'samples'/f'{phase}-step-{step:07d}.json'
+            temporary = path.with_suffix('.json.tmp')
+            write_json(temporary, {'step': step, 'phase': phase, 'samples': results,
+                                  'complete': index == len(prompts), 'total_samples': len(prompts)})
+            temporary.replace(path)
+        log_progress(args, rank, 'sample_complete', **context,
+                     output_tokens=len(generated), stop_reason=reason, seconds=time.perf_counter()-tick)
     dist.barrier(group=group)
+    log_progress(args, rank, 'samples_complete', step=step, phase=phase)
 
 
 def main():
@@ -330,11 +353,18 @@ def run_training(args, device, rank, students, group, saved):
     cursor = train.EpochBatchIterator(loader, sampler, epoch, batch_in_epoch)
     val_order = np.random.default_rng(args.seed+1).permutation(len(valid)).tolist()
 
-    def validation(all_examples=False):
+    def validation(phase, all_examples=False):
         order = val_order if all_examples else val_order[:students*args.val_examples_per_rank]
+        tick = time.perf_counter()
+        log_progress(args, rank, 'validation_start', step=step, phase=phase, examples=len(order))
         batches = validation_batches(valid, order, rank, students, args.batch_size,
                                      args.sequence_length, tokenizer.pad_token_id)
-        return validate(model, channel, batches, device, group)
+        values = validate(model, channel, batches, device, group)
+        if rank == 0:
+            train.emit(args.run_dir, 'validation.jsonl', {'step': step, 'phase': phase, **values})
+        log_progress(args, rank, 'validation_complete', step=step, phase=phase,
+                     seconds=time.perf_counter()-tick, **values)
+        return values
 
     def elapsed():
         return time.time()-args.run_start_unix
@@ -357,11 +387,10 @@ def run_training(args, device, rank, students, group, saved):
     _, reason, _ = train.training_control(args, step, elapsed(), stop_requested['value'], device,
         epoch=cursor.epoch, batch_in_epoch=cursor.batch_in_epoch, batches_per_epoch=len(loader), group=group)
     if reason is None:
-        values = validation()
-        if rank == 0:
-            train.emit(args.run_dir, 'validation.jsonl', {'step': step, 'phase': 'initial', **values})
+        values = validation('initial')
         if not args.skip_samples and not args.skip_initial_samples:
             record_samples(model, tokenizer, args, step, rank, group, device, 'initial')
+    log_progress(args, rank, 'training_loop_start', step=step, stop_reason=reason)
     while reason is None:
         _, reason, lr = train.training_control(args, step, elapsed(), stop_requested['value'], device,
             epoch=cursor.epoch, batch_in_epoch=cursor.batch_in_epoch, batches_per_epoch=len(loader), group=group)
@@ -412,18 +441,14 @@ def run_training(args, device, rank, students, group, saved):
         if step % args.save_every == 0:
             save_checkpoint(model, optimizer, args, step, cursor, elapsed(), students, rank, group)
         if step % args.validate_every == 0:
-            values = validation()
-            if rank == 0:
-                train.emit(args.run_dir, 'validation.jsonl', {'step': step, 'phase': 'periodic', **values})
+            values = validation('periodic')
         if not args.skip_samples and step % args.sample_every == 0:
             record_samples(model, tokenizer, args, step, rank, group, device, 'periodic')
     final_path = save_checkpoint(model, optimizer, args, step, cursor, elapsed(), students, rank, group)
     values = None
     if reason != 'save_and_exit':
         if not args.skip_final_validation:
-            values = validation(all_examples=True)
-            if rank == 0:
-                train.emit(args.run_dir, 'validation.jsonl', {'step': step, 'phase': 'final_all_heldout', **values})
+            values = validation('final_all_heldout', all_examples=True)
         if not args.skip_samples:
             record_samples(model, tokenizer, args, step, rank, group, device, 'final')
     channel.command(channel.STOP)

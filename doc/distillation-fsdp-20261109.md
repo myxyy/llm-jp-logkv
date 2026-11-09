@@ -12,7 +12,7 @@
   --run-name distill-full-fsdp-20261109 \
   --teacher-gpu 0 --gpus 1,2,3,4,5 \
   --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-all-reasoning-20261103-100k \
-  --no-rope --conv-kernel-size 4
+  --no-rope --conv-kernel-size 4 --skip-samples
 ```
 
 - `--teacher-gpu` は教師専用GPU、`--gpus` は生徒GPUのみ。重複を拒否する。
@@ -20,6 +20,9 @@
 - RoPEなし・conv4は上の例での指定。省略時の構成は従来どおりRoPEあり・convなし。
 - 既定: 1 epoch、時間無制限、系列長1,024、各生徒batch1、勾配蓄積4、最新2 checkpoint保持。
 - 語彙方向のメモリ節約のため `--loss-chunk-tokens` は64を既定とする。
+- 上の例では `--skip-samples` で初回・定期・終了時の文章生成を省略する。
+  loss検証は省略しない。文章生成を行う場合はこの指定を外す。
+  `--skip-initial-samples` は初回だけ省略し、定期・終了時の生成は残す。
 - 再開は同じコマンドに `--resume latest` を追加する。GPU番号の入れ替えは可能だが、
   生徒台数と訓練・データ設定は同じにする。DDPやLoRAのcheckpointからのresumeは拒否する。
 - `--num-epochs` / `--max-steps` は再開前を含む総数。`--max-hours` は任意指定。
@@ -59,6 +62,26 @@ lossを全生徒の有効token総数で正規化し、clip normは全shardにわ
 データを重複して採点しない。初回・定期検証は `--val-examples-per-rank` に基づく限定集合、
 正常終了時は全held-outを検証する。生成サンプルは全生徒が同じ入力を処理し、
 rank0が選んだtokenとEOSに揃える。教師はこの間待機する。
+
+### 生成中に学習ログが出ない場合
+
+生成を有効にすると、最初のoptimizer更新より前に6問×最大256 tokensの生成を行う。
+FSDPで分割したAttention/convの重みを各token・各層で集め直すため、
+訓練のまとめた系列forwardよりも通信の負担が大きい。
+実8Bの本番run `distill-full-fsdp-20261109` では、22:53:37 JSTに初期検証が完了し、
+23:19 JSTでも3問目の242 token目を生成中だった。その後4問目への進行を確認した。
+この時点では学習step 0であり、初期生成に時間を使っていた。
+GPU使用率だけでは計算の進行とNCCL待機を判別できないため、workerのスタックと
+生成位置の変化を確認した。先の実8B VRAM確認は `--skip-samples` 付きであり、
+この生成時間は確認できていなかった。
+
+進捗表示修正後は、`training.log` と `experiments/RUN/latest/progress.jsonl` に
+検証の開始・終了、各問のprefill完了・最初のtoken・16 tokensごと・生成完了を記録する。
+`samples/PHASE-step-NNNNNNN.json` も1問完了ごとに原子的に更新し、
+全問完了前は `complete: false`、全問完了後は `complete: true` とする。
+実行中の旧プロセスにはコード変更は反映されない。
+現状の `save_and_exit` はstep境界で処理するため、生成の途中では即座に停止しない。
+診断記録は `/mnt/raid0/llm-jp-logkv/logs/fsdp-startup-debug-20261109-01/`。
 
 ## 保存
 

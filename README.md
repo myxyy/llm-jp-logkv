@@ -280,8 +280,13 @@ Attentionと有効なCausalConvの重み・勾配・Adam状態をFSDP2で分割�
   --run-name distill-full-fsdp-20261109 \
   --teacher-gpu 0 --gpus 1,2,3,4,5 \
   --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-all-reasoning-20261103-100k \
-  --no-rope --conv-kernel-size 4
+  --no-rope --conv-kernel-size 4 --skip-samples
 ```
+
+上の例は訓練中の文章生成を省略します。FSDPの逐次生成には各tokenで重みを集める通信があり、
+実8Bでは初期サンプル6問だけでも数十分かかります。`--skip-samples` を外すと生成を有効化し、
+`--skip-initial-samples` なら初回だけ省略します。損失の検証はどちらでも実行します。
+検証・生成の進捗は `training.log` と `experiments/RUN/latest/progress.jsonl` に出力します。
 
 再開は同じコマンドに `--resume latest` を追加します。`control.cmd` の `save_and_exit` にも対応。
 FSDP再開は同じ生徒台数・訓練設定が必要で、DDP/LoRA checkpointからのresumeは受け付けません。
