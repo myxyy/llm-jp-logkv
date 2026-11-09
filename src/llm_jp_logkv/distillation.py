@@ -152,6 +152,14 @@ class DistillationModel(nn.Module):
         inputs, targets = token_ids[:, :-1], token_ids[:, 1:]
         with torch.no_grad():
             teacher_hidden = self.teacher.model(inputs, use_cache=False).last_hidden_state
+        return self.loss_from_teacher_hidden(token_ids, lengths, teacher_hidden)
+
+    def loss_from_teacher_hidden(self, token_ids, lengths, teacher_hidden):
+        """Same exact vocabulary loss with detached final-normalized teacher states."""
+        inputs, targets = token_ids[:, :-1], token_ids[:, 1:]
+        if teacher_hidden.shape != (*inputs.shape, self.student.config.hidden_size):
+            raise ValueError('Teacher hidden shape does not match the input batch')
+        teacher_hidden = teacher_hidden.detach()
         hidden = self.student_hidden(inputs)
         positions = torch.arange(inputs.shape[1], device=inputs.device)[None]
         mask = positions < (lengths[:, None] - 1)

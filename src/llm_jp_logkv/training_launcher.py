@@ -28,9 +28,9 @@ def parse_args(argv=None):
     return args
 
 
-def trainer_arguments(args):
+def trainer_arguments(args, trainer=train):
     result = []
-    for action in train.build_parser()._actions:
+    for action in trainer.build_parser()._actions:
         if action.dest == 'help':
             continue
         value = getattr(args, action.dest)
@@ -42,11 +42,11 @@ def trainer_arguments(args):
     return result
 
 
-def launch(args):
+def launch(args, trainer=train, module='llm_jp_logkv.train'):
     with exclusive_run(args.run_dir) as (token, lock_fd):
-        args.resume = resolve_resume(args, train.SETTINGS)
+        args.resume = resolve_resume(args, trainer.SETTINGS)
         session_id = new_session_id()
-        log_dir = named_directory(train.SETTINGS, 'LOG_DIR', args.run_name)
+        log_dir = named_directory(trainer.SETTINGS, 'LOG_DIR', args.run_name)
         records = create_session(log_dir, session_id)
         def record(name, value):
             with (records/name).open('x') as stream:
@@ -56,8 +56,8 @@ def launch(args):
                'TOKENIZERS_PARALLELISM':'false', 'PYTHONUNBUFFERED':'1', 'HF_HUB_DISABLE_PROGRESS_BARS':'1',
                'LLM_JP_LOGKV_RUN_TOKEN':token, 'LLM_JP_LOGKV_SESSION_ID':session_id}
         command = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
-                   f'--nproc_per_node={len(args.gpus.split(","))}', '-m', 'llm_jp_logkv.train',
-                   *trainer_arguments(args)]
+                   f'--nproc_per_node={len(args.gpus.split(","))}', '-m', module,
+                   *trainer_arguments(args, trainer)]
         with (log_dir/'training.log').open('a') as log:
             log.write(f'\n=== session {session_id}; resume={args.resume} ===\n')
             log.flush()

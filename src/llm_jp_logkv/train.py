@@ -185,7 +185,8 @@ def consume_save_and_exit(path):
     return True
 
 
-def training_control(args, step, elapsed, stop_requested, device, *, epoch, batch_in_epoch, batches_per_epoch):
+def training_control(args, step, elapsed, stop_requested, device, *, epoch, batch_in_epoch, batches_per_epoch,
+                     group=None):
     """Broadcast the same stop reason and LR to every rank before the next update."""
     control=torch.zeros(3,device=device,dtype=torch.float64)
     if dist.get_rank()==0:
@@ -212,7 +213,10 @@ def training_control(args, step, elapsed, stop_requested, device, *, epoch, batc
         progress=min(progress,1.)
         lr=args.lr*min(1.,(step+1)/max(args.warmup_steps,1))*(args.min_lr_ratio+(1-args.min_lr_ratio)*.5*(1+math.cos(math.pi*progress)))
         control[:]=torch.tensor([elapsed,STOP_REASONS.index(reason),lr],device=device)
-    dist.broadcast(control,src=0)
+    if group is None:
+        dist.broadcast(control,src=0)
+    else:
+        dist.broadcast(control,src=0,group=group)
     elapsed,reason_code,lr=control.tolist()
     return elapsed,STOP_REASONS[int(reason_code)],lr
 
