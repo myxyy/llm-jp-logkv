@@ -265,11 +265,29 @@ AttentionをLoRAではなく直接学習する場合は、新しいrunで **`--a
 `--rank` / `--alpha` は使いません。再開時も `--attention-training full` を指定し、
 推論・チャットではcheckpointから学習方式を自動復元します。LoRAとfullの間での再開は拒否します。
 
-fullは大容量GPU向けです。現状のDDPでは各GPUにBF16教師約16 GiBとFP32 Attentionの
+従来の `run_distillation.py` のDDPでは、各GPUにBF16教師約16 GiBとFP32 Attentionの
 重み・勾配・Adam状態20 GiBが必要で、中間値・通信領域を除いても約36 GiBになります。
 **RTX 3090（24 GiB）には収まらず、GPU台数を増やしても1台あたりの使用量は減りません。**
-CPU offloadやモデル・optimizerの分割は未実装です。
 [fullの条件・保存容量・検証](doc/distillation-20261102.md#attentionの全パラメータ学習2026-11-08)を参照してください。
+
+RTX 3090 × 6では、専用の `run_distillation_fsdp.py` で教師1台・生徒5台に分けられます。
+`--gpus` は**生徒だけ**を指定し、`--teacher-gpu` と重複させません。既定は教師0、生徒1〜5。
+Attentionと有効なCausalConvの重み・勾配・Adam状態をFSDP2で分割し、FFNなどは凍結します。
+このスクリプトはfull専用です。1 epoch・時間無制限・最新2 checkpoint保持が既定です。
+
+```bash
+./scripts/uv.sh run --locked python scripts/run_distillation_fsdp.py \
+  --run-name distill-full-fsdp-20261109 \
+  --teacher-gpu 0 --gpus 1,2,3,4,5 \
+  --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-all-reasoning-20261103-100k \
+  --no-rope --conv-kernel-size 4
+```
+
+再開は同じコマンドに `--resume latest` を追加します。`control.cmd` の `save_and_exit` にも対応。
+FSDP再開は同じ生徒台数・訓練設定が必要で、DDP/LoRA checkpointからのresumeは受け付けません。
+保存した `adapter.pt` は通常のチャット・推論で使用できます。
+初回は `--max-steps 2 --skip-samples --skip-final-validation --val-examples-per-rank 1` を付けた
+別runでVRAMを確認できます。詳細は [専用教師＋FSDP2訓練](doc/distillation-fsdp-20261109.md)。
 
 `--run-dir`・`--log-dir` は廃止しました。保存先は `.env` の設定とrun名から自動決定します。
 ログは `logs/RUN/training.log` に追記し、checkpointは `checkpoints/RUN/step-NNNNNNN/` に保存します。

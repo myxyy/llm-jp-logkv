@@ -261,7 +261,10 @@ fullでは `--rank` / `--alpha` は無視し、checkpointの対応フィール�
 | fullのtraining_state.pt中のAdam状態（tensor本体） | 約10 GiB |
 
 DDPは各GPUにモデルとoptimizerを複製する。RTX 3090の24 GiBでは不足し、
-6 GPUへ増やしても解消しない。CPU offloadやパラメータ・optimizerの分割は未実装。
+6 GPUへ増やしても解消しない。これは従来の `run_distillation.py` のDDPについての制約。
+2026-11-09に追加した専用教師＋FSDP2スクリプトでは、Attentionの重み・勾配・optimizerを
+生徒GPU間で分割できる（CPU offloadは未実装）。詳細は
+[専用教師＋FSDP2訓練](distillation-fsdp-20261109.md)。
 checkpointは1個あたり約15 GiB＋metadataとなり、既定の2個保持では約30 GiB。
 新規保存の完了後に古いものを削除するため、保存中はさらに1個分の空き領域が必要。
 hash計算は大きいファイル全体をRAMに読み込まず、ストリームで計算する。
