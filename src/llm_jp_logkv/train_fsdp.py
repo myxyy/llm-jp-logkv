@@ -24,7 +24,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, LlamaForCausalLM
 
-from .distillation import load_adapter
+from .distillation import load_adapter, loss_metrics
 from .inference import file_hash, write_json
 from .remote_fsdp import (RemoteStudent, TeacherChannel, shard_student, clip_sharded_grad_norm,
                           full_adapter_state, local_optimizer_state, restore_local_optimizer)
@@ -166,7 +166,7 @@ def validation_batches(data, order, rank, students, batch_size, sequence_length,
 
 @torch.no_grad()
 def validate(model, channel, batches, device, group):
-    totals = torch.zeros(3, device=device, dtype=torch.float64)
+    totals = torch.zeros(model.stats_size, device=device, dtype=torch.float64)
     for ids, lengths in batches:
         ids, lengths = ids.to(device), lengths.to(device)
         teacher_hidden = channel.hidden(ids[:, :-1])
@@ -178,7 +178,7 @@ def validate(model, channel, batches, device, group):
     dist.all_reduce(totals, group=group)
     if totals[2].item() <= 0:
         raise ValueError('Validation has no scored tokens')
-    return {'kl': (totals[0]/totals[2]).item(), 'ce': (totals[1]/totals[2]).item(),
+    return {**loss_metrics(totals, model.ce_weight, model.hidden_mse_weight),
             'tokens': int(totals[2].item())}
 
 
@@ -295,10 +295,10 @@ def run_training(args, device, rank, students, group, saved):
             'student_world_size': students, 'teacher_global_rank': students,
             'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
             'torch': torch.__version__, 'gpu': torch.cuda.get_device_name(device),
-            'teacher_backend': 'sdpa; sequential per-student batches; final normalized BF16 hidden transfer',
+            'teacher_backend': 'sdpa; sequential per-student batches; final normalized BF16 hidden transfer; all raw block states when hidden_mse_weight > 0',
             'sharding': 'FSDP2 trainable attention and conv only; replicated frozen student modules',
             'optimizer': 'AdamW FP32 master/moments, foreach=False, betas=(0.9,0.95), weight_decay=0.01',
-            'objective': 'Exact full-vocabulary KL(teacher || student)*T^2 + ce_weight*next-token CE',
+            'objective': 'Exact full-vocabulary KL(teacher || student)*T^2 + ce_weight*next-token CE + hidden_mse_weight*mean all-block MSE',
             'gradient_accumulation': 'Reduce-scatter every microbatch; global nonpadding-token normalization'})
     dist.barrier()
     teacher = load_source(device) if rank == students else None
@@ -309,7 +309,8 @@ def run_training(args, device, rank, students, group, saved):
             torch.manual_seed(args.seed)
             model = RemoteStudent(source, chunk_size=args.chunk_size, no_rope=args.no_rope,
                 conv_kernel_size=args.conv_kernel_size, loss_chunk_tokens=args.loss_chunk_tokens,
-                temperature=args.temperature, ce_weight=args.ce_weight)
+                temperature=args.temperature, ce_weight=args.ce_weight,
+                hidden_mse_weight=args.hidden_mse_weight)
             del source
             if args.resume:
                 load_adapter(model.student, torch.load(args.resume/'adapter.pt', map_location='cpu', weights_only=True))
@@ -317,7 +318,8 @@ def run_training(args, device, rank, students, group, saved):
             gc.collect()
         dist.barrier()
     if rank == students:
-        channel = TeacherChannel(device, students, teacher.config.hidden_size)
+        channel = TeacherChannel(device, students, teacher.config.hidden_size,
+                                 teacher.config.num_hidden_layers if args.hidden_mse_weight else 0)
         torch.cuda.reset_peak_memory_stats(device)
         channel.serve(teacher)
         write_json(args.session_dir/'teacher-completed.json', {
@@ -341,7 +343,8 @@ def run_training(args, device, rank, students, group, saved):
         dist.broadcast_object_list(start, src=0, group=group)
         args.run_start_unix = start[0]
     tokenizer = AutoTokenizer.from_pretrained(SETTINGS.model_path, local_files_only=True)
-    channel = TeacherChannel(device, students, model.student.config.hidden_size)
+    channel = TeacherChannel(device, students, model.student.config.hidden_size,
+                             len(model.student.layers) if args.hidden_mse_weight else 0)
     data = TokenCache(args.data, 'train', args.sequence_length)
     valid = TokenCache(args.data, 'valid', args.sequence_length)
     sampler = DistributedSampler(data, num_replicas=students, rank=rank, shuffle=True,
@@ -405,7 +408,7 @@ def run_training(args, device, rank, students, group, saved):
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
         tick = time.perf_counter()
-        totals = torch.zeros(3, device=device, dtype=torch.float64)
+        totals = torch.zeros(model.stats_size, device=device, dtype=torch.float64)
         for ids, lengths in batches:
             ids, lengths = ids.to(device), lengths.to(device)
             teacher_hidden = channel.hidden(ids[:, :-1])
@@ -430,8 +433,7 @@ def run_training(args, device, rank, students, group, saved):
         dist.all_reduce(peak, op=dist.ReduceOp.MAX, group=group)
         if rank == 0:
             metrics = {'step': step, 'elapsed_seconds': elapsed(), 'lr': lr,
-                'kl': (totals[0]/totals[2]).item(), 'ce': (totals[1]/totals[2]).item(),
-                'loss': ((totals[0]+args.ce_weight*totals[1])/totals[2]).item(),
+                **loss_metrics(totals, args.ce_weight, args.hidden_mse_weight),
                 'grad_norm': norm.item(), 'valid_tokens': int(totals[2].item()),
                 'step_seconds': seconds, 'valid_tokens_per_second': totals[2].item()/seconds,
                 'epoch': cursor.epoch, 'batch_in_epoch': cursor.batch_in_epoch,

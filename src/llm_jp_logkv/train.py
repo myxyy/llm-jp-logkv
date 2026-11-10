@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from transformers import AutoTokenizer, LlamaForCausalLM
 
-from .distillation import DistillationModel, adapter_state, load_adapter
+from .distillation import DistillationModel, adapter_state, load_adapter, loss_metrics
 from .inference import file_hash, write_json
 from .training_data import TokenCache, collate_tokens
 from .training_runs import (checkpoint_metadata, completed_checkpoints, create_session, exclusive_run,
@@ -62,6 +62,8 @@ def build_parser():
     p.add_argument('--loss-chunk-tokens',type=int,default=512)
     p.add_argument('--temperature',type=float,default=1.)
     p.add_argument('--ce-weight',type=float,default=.1)
+    p.add_argument('--hidden-mse-weight',type=float,default=0.,
+                   help='All-block output MSE weight; mean over layers/features/valid tokens (default: 0, disabled)')
     p.add_argument('--lr',type=float,default=1e-4)
     p.add_argument('--min-lr-ratio',type=float,default=.1)
     p.add_argument('--warmup-steps',type=int,default=50)
@@ -80,6 +82,8 @@ def build_parser():
 def parse_args(argv=None, parser=None):
     p=parser or build_parser()
     args=p.parse_args(argv)
+    if not math.isfinite(args.hidden_mse_weight) or args.hidden_mse_weight < 0:
+        p.error('--hidden-mse-weight must be finite and nonnegative')
     if min(args.sequence_length,args.batch_size,args.grad_accum,args.loss_chunk_tokens,args.val_examples_per_rank,args.sample_max_new_tokens) < 1:
         p.error('Lengths, sizes, and intervals must be positive')
     if args.attention_training=='lora' and args.rank<1:
@@ -131,13 +135,14 @@ def check_model_config(saved, args):
 
 def training_signature(args):
     return {key:getattr(args,key) for key in ('sequence_length','batch_size','grad_accum','lr',
-        'min_lr_ratio','warmup_steps','temperature','ce_weight','loss_chunk_tokens','seed')}
+        'min_lr_ratio','warmup_steps','temperature','ce_weight','hidden_mse_weight','loss_chunk_tokens','seed')}
 
 
 def check_resume_signature(saved, args):
     # Old checkpoints included max_hours. Limits may change on resume; model,
     # loss, optimizer hyperparameters and data-order settings must still match.
     saved={key:value for key,value in saved.items() if key not in ('max_hours','num_epochs')}
+    saved={'hidden_mse_weight':0.,**saved}
     if saved!=training_signature(args):
         raise ValueError('Resume training/data-order configuration differs')
 
@@ -275,7 +280,7 @@ def save_checkpoint(model, optimizer, args, step, epoch, batch_in_epoch, elapsed
 
 @torch.no_grad()
 def validate(model, loader, device):
-    totals=torch.zeros(3,device=device,dtype=torch.float64)
+    totals=torch.zeros(model.stats_size,device=device,dtype=torch.float64)
     for ids,lengths in loader:
         with torch.autocast('cuda',dtype=torch.bfloat16):
             _,stats=model(ids.to(device,non_blocking=True),lengths.to(device,non_blocking=True))
@@ -283,7 +288,7 @@ def validate(model, loader, device):
             raise FloatingPointError('Non-finite validation metrics')
         totals+=stats.double()
     dist.all_reduce(totals)
-    return {'kl':(totals[0]/totals[2]).item(),'ce':(totals[1]/totals[2]).item(),
+    return {**loss_metrics(totals,model.ce_weight,model.hidden_mse_weight),
             'tokens':int(totals[2].item())}
 
 
@@ -387,7 +392,7 @@ def run_training(args, device, rank, world):
                          'weight_decay':.01,'gradient_clip_norm':1.},
             'sampling':{'reasoning_effort':'low','conversation_start_date':'2026-11-02',
                         'generation':'greedy','prefill_chunk_size':128},
-            'objective':'Exact full-vocabulary KL(teacher || student) * T^2 + ce_weight * next-token CE; all nonpadding targets',
+            'objective':'Exact full-vocabulary KL(teacher || student) * T^2 + ce_weight * next-token CE + hidden_mse_weight * mean all-block MSE; all nonpadding targets',
             'checkpointing':'non-reentrant decoder-layer and vocabulary-loss checkpoints; grouped LogKV',
             'time_budget':'unlimited unless max_hours is explicit; then wall time from original training start including downtime and periodic work',
             'lr_schedule':'epoch progress' if args.num_epochs else 'wall time' if args.max_hours is not None else 'optimizer steps',
@@ -402,7 +407,8 @@ def run_training(args, device, rank, world):
     model=DistillationModel(teacher,rank=args.rank,alpha=args.alpha,chunk_size=args.chunk_size,
         attention_training=args.attention_training,
         no_rope=args.no_rope,conv_kernel_size=args.conv_kernel_size,
-        loss_chunk_tokens=args.loss_chunk_tokens,temperature=args.temperature,ce_weight=args.ce_weight)
+        loss_chunk_tokens=args.loss_chunk_tokens,temperature=args.temperature,ce_weight=args.ce_weight,
+        hidden_mse_weight=args.hidden_mse_weight)
     params=[p for p in model.parameters() if p.requires_grad]
     optimizer=torch.optim.AdamW(params,lr=args.lr,betas=(.9,.95),weight_decay=.01,fused=True)
     step=epoch=batch_in_epoch=0; prior_elapsed=0.
@@ -495,7 +501,7 @@ def run_training(args, device, rank, world):
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device);tick=time.perf_counter()
-        totals=torch.zeros(3,device=device,dtype=torch.float64)
+        totals=torch.zeros(model.stats_size,device=device,dtype=torch.float64)
         from contextlib import nullcontext
         for micro,(ids,lengths) in enumerate(batches):
             context=ddp.no_sync() if micro+1<len(batches) else nullcontext()
@@ -519,8 +525,7 @@ def run_training(args, device, rank, world):
         dist.all_reduce(peak,op=dist.ReduceOp.MAX)
         if rank==0:
             metrics={'step':step,'elapsed_seconds':prior_elapsed+time.monotonic()-started,
-                'lr':lr,'kl':(totals[0]/totals[2]).item(),'ce':(totals[1]/totals[2]).item(),
-                'loss':((totals[0]+args.ce_weight*totals[1])/totals[2]).item(),
+                'lr':lr,**loss_metrics(totals,args.ce_weight,args.hidden_mse_weight),
                 'grad_norm':norm.item(),'valid_tokens':int(totals[2].item()),'step_seconds':seconds,
                 'epoch':cursor.epoch,'batch_in_epoch':cursor.batch_in_epoch,'microbatches_per_rank':len(batches),
                 'valid_tokens_per_second':totals[2].item()/seconds,'max_rank_peak_allocated_bytes':int(peak.item())}

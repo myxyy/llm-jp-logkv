@@ -294,6 +294,14 @@ FSDP再開は同じ生徒台数・訓練設定が必要で、DDP/LoRA checkpoint
 初回は `--max-steps 2 --skip-samples --skip-final-validation --val-examples-per-rank 1` を付けた
 別runでVRAMを確認できます。詳細は [専用教師＋FSDP2訓練](doc/distillation-fsdp-20261109.md)。
 
+各ブロックの教師・生徒出力を近づける補助損失は `--hidden-mse-weight 0.1` で追加できます。
+通常のLoRA/full蒸留と専用教師＋FSDPの双方に対応し、FFNは凍結を維持します。
+既定は `0`（無効）。全32層のFFN後・残差加算後、末尾RMSNorm前の出力を比較し、
+有効token・隠れ次元・層で平均した生のMSEをKL＋CEに加えます。
+`0.1` は指定例であり、最適係数ではありません。再開時は同じ係数が必要です。
+FSDPでは教師状態の転送とVRAM使用量が増えます。
+[損失・ログ・起動例](doc/distillation-20261102.md#ブロック出力のmse蒸留2026-11-10)を参照してください。
+
 `--run-dir`・`--log-dir` は廃止しました。保存先は `.env` の設定とrun名から自動決定します。
 ログは `logs/RUN/training.log` に追記し、checkpointは `checkpoints/RUN/step-NNNNNNN/` に保存します。
 起動ごとの設定・終了記録・生成例は `experiments/RUN/sessions/ID/`、監督プロセスの記録は

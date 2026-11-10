@@ -41,6 +41,53 @@ DDPの平均化と勾配蓄積に合わせて、全rankの有効トークン数�
 短い後処理として加わる。再開時も元の開始時刻を保持し、停止中の時間を含めるため、
 再開のたびに8時間の予算を追加しない。
 
+## ブロック出力のMSE蒸留（2026-11-10）
+
+`--hidden-mse-weight WEIGHT` で、出力KL＋CEに全32層のブロック出力MSEを追加できる。
+既定は `0`。0では教師の中間状態を取得・転送せず、従来と同じ損失・勾配になる。
+負数・NaN・無限大は拒否する。通常のLoRA/full、専用教師＋FSDPの両方に対応。
+
+```text
+loss = KL(teacher || student) × T² + ce_weight × CE
+       + hidden_mse_weight × mean_layer(mean_valid_token(mean_hidden_dimension((student - teacher)²)))
+```
+
+比較するのは各decoderブロックのFFN後・残差加算後。最終ブロックも末尾RMSNormより前。
+教師のforward hookでこの位置を直接取得し、最終正規化後hiddenとの取り違えを避ける。
+教師・生徒は同じトークン列を受け取り、それぞれ自身の前層出力を次層へ渡す。
+教師側の勾配だけを切り、FFNを凍結した生徒側ではその計算を通してAttention/convへ勾配を流す。
+MSEはFP32で計算し、KL/CEと同じ非padding next-token位置を使う。
+勾配蓄積・全rankにわたる有効token総数で正規化する。教師RMSによる正規化は行わない。
+大きなFP32差分はdecoder層のactivation checkpoint内で再計算する。
+
+有効時は `metrics.jsonl` / `validation.jsonl` に以下を追加する。
+
+- `hidden_mse`: 係数適用前の全層平均MSE。
+- `weighted_hidden_mse`: 係数を掛けたlossへの寄与。
+- `hidden_mse_by_layer`: 第1層〜第32層のMSEの配列。
+- `teacher_rms_by_layer`: 同じ有効token・隠れ次元で集計した教師状態のRMSの配列。
+- `loss`: KL・重み付きCE・重み付きMSEの合計。検証ログにも記録する。
+
+通常のLoRA蒸留なら、例えば新しいrunで次のように指定する。
+
+```bash
+./scripts/uv.sh run --locked python scripts/run_distillation.py \
+  --run-name distill-hidden-mse-20261110 \
+  --gpus 0,1 \
+  --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-all-reasoning-20261103-100k \
+  --rank 128 --alpha 256 --hidden-mse-weight 0.1
+```
+
+係数 `0.1` は指定例で、品質の検証や最適化はまだ行っていない。
+層別のMSEと教師RMSを見ながらKLとの寄与を比較し、生成品質は別に評価する。
+1 epoch・時間無制限などの既定値は維持する。
+係数はcheckpointの `training_signature` と起動manifestに記録し、再開時の変更は拒否する。
+この設定を持たない旧checkpointは係数0として再開できる。
+既存runの `--resume latest` に係数だけ追加してMSE学習へ切り替える操作には対応しない。
+推論用adapterの構造は変わらず、チャット・推論では追加引数不要。
+
+専用教師＋FSDPの起動例と追加通信量は [専用訓練ドキュメント](distillation-fsdp-20261109.md#ブロック出力mseの追加2026-11-10)を参照。
+
 ## データ
 
 ### 拡充版（2026-11-03）

@@ -43,7 +43,8 @@
 
 教師は各生徒の入力を受け取り、最終RMSNorm後のBF16 hidden stateを返す。
 生徒側の同じ凍結LM headから全語彙の教師分布を計算するため、目的関数は従来の
-`KL(teacher || student) × T² + ce_weight × NTP CE` のまま。hidden同士のMSEには変更しない。
+既定の目的関数は `KL(teacher || student) × T² + ce_weight × NTP CE` のまま。
+`--hidden-mse-weight` を指定した場合だけ、後述のブロック出力MSEを追加する。
 有効な全非padding targetsを使い、CE係数の既定は0.1。
 1,024 tokens・batch1の場合、転送hiddenは8 MiBで、BF16全語彙logitsの384 MiBより小さい。
 
@@ -82,6 +83,28 @@ GPU使用率だけでは計算の進行とNCCL待機を判別できないため�
 実行中の旧プロセスにはコード変更は反映されない。
 現状の `save_and_exit` はstep境界で処理するため、生成の途中では即座に停止しない。
 診断記録は `/mnt/raid0/llm-jp-logkv/logs/fsdp-startup-debug-20261109-01/`。
+
+## ブロック出力MSEの追加（2026-11-10）
+
+```bash
+./scripts/uv.sh run --locked python scripts/run_distillation_fsdp.py \
+  --run-name distill-full-fsdp-mse-20261110 \
+  --teacher-gpu 0 --gpus 1,2,3,4,5 \
+  --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-all-reasoning-20261103-100k \
+  --no-rope --conv-kernel-size 4 --hidden-mse-weight 0.1 --skip-samples
+```
+
+全32層のFFN後・残差加算後、末尾RMSNorm前の出力を1対1で比較する。
+係数0が既定。`0.1` は指定例で、最適係数や品質向上を確認した値ではない。
+詳しい平均の定義と層別ログは [MSE損失の説明](distillation-20261102.md#ブロック出力のmse蒸留2026-11-10)を参照。
+再開は同じ係数で `--resume latest`。係数なしの旧checkpointは0扱いで、途中の係数変更は拒否する。
+
+有効時、教師は各生徒batchの全ブロック出力を1つのBF16 bufferへコピーし、
+最終正規化後hiddenに続けて送る。1生徒分を送った後に解放して次のbatchを処理する。
+系列長1,024・batch1・隠れ次元4,096の場合、追加bufferは生徒1台あたり256 MiB。
+教師から生徒5台への追加転送はmicrobatchあたり1.25 GiB、勾配蓄積4では1更新あたり5 GiB。
+一時演算領域やcheckpoint再計算もあるため、これだけをVRAMピークの増分とは見なさない。
+0指定時はbufferの確保・ブロック状態の追加転送を行わない。
 
 ## 保存
 

@@ -10,7 +10,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, register_fsdp_forward_method
 from torch.distributed.tensor import DTensor
 
-from .distillation import DistillationModel
+from .distillation import DistillationModel, teacher_hidden_states
 
 
 class RemoteStudent(DistillationModel):
@@ -72,12 +72,15 @@ class TeacherChannel:
     All requests have the same padded shape. The teacher processes one student's
     batch at a time, so five students do not imply a five-times-larger teacher
     activation peak. The world barrier separates world P2P and student collectives.
+    With block supervision, each final-state message is followed by one contiguous
+    [layers, batch, tokens, hidden] BF16 message. Disabled mode sends only final states.
     """
     FORWARD, STOP = 1, 2
 
-    def __init__(self, device, students, hidden_size):
+    def __init__(self, device, students, hidden_size, block_layers=0):
         self.device, self.students, self.hidden_size = device, students, hidden_size
         self.teacher_rank = students
+        self.block_layers = block_layers
 
     def command(self, code, batch=0, length=0):
         header = torch.tensor([code, batch, length], device=self.device, dtype=torch.int64)
@@ -92,6 +95,11 @@ class TeacherChannel:
         dist.send(inputs, dst=self.teacher_rank)
         result = torch.empty(batch, length, self.hidden_size, dtype=torch.bfloat16, device=self.device)
         dist.recv(result, src=self.teacher_rank)
+        if self.block_layers:
+            blocks = torch.empty(self.block_layers, batch, length, self.hidden_size,
+                                 dtype=torch.bfloat16, device=self.device)
+            dist.recv(blocks, src=self.teacher_rank)
+            result = {'final': result, 'blocks': blocks}
         dist.barrier()
         return result
 
@@ -110,8 +118,12 @@ class TeacherChannel:
                 dist.recv(inputs, src=rank)
                 batches.append(inputs)
             for rank, inputs in enumerate(batches):
-                hidden = teacher.model(inputs, use_cache=False).last_hidden_state.contiguous()
-                dist.send(hidden, dst=rank)
+                hidden = teacher_hidden_states(teacher, inputs, include_blocks=bool(self.block_layers))
+                if self.block_layers:
+                    dist.send(hidden['final'].contiguous(), dst=rank)
+                    dist.send(hidden['blocks'], dst=rank)
+                else:
+                    dist.send(hidden.contiguous(), dst=rank)
                 del hidden
             dist.barrier()
 
