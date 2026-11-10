@@ -106,6 +106,27 @@ GPU使用率だけでは計算の進行とNCCL待機を判別できないため�
 一時演算領域やcheckpoint再計算もあるため、これだけをVRAMピークの増分とは見なさない。
 0指定時はbufferの確保・ブロック状態の追加転送を行わない。
 
+2026-11-10に係数0.1で実8B・教師1＋生徒5の短い確認を実施した。
+系列長1,024・batch1・勾配蓄積4・RoPEなし・conv4・loss chunk64で、
+初期検証、全32層のMSE/RMS記録、2回の更新、checkpoint保存まで正常終了した。
+文章生成と終了時全held-out検証は省略。run名は `hidden-mse-full-preflight-20261110-01`。
+
+| step | 生徒の学習step中割当ピーク | 更新時間 |
+|---|---:|---:|
+| 1 | 17.56 GiB | 44.10秒 |
+| 2 | 18.62 GiB | 44.01秒 |
+
+教師の割当ピークは16.37 GiB。PyTorch allocated値であり、CUDA/NCCLの外部確保と
+allocatorのreservedは含まない。OOMなし、`reason=max_steps` で終了しGPU解放済み。
+初期検証ではKL=13.73、CE=14.78、MSE=50.59、重み付きMSE=5.06だった。
+係数0.1でもMSEの寄与は小さくなく、最適な係数や生成品質は未検証。
+
+CPU 380 passed。小型BF16・教師1＋生徒5では連続実行と中断再開後の全学習重み・
+5 optimizer shardsが完全一致し、単一GPUの順次参照との更新差は最大7.28e-12。
+全rankのtoken数で集約した層別MSE/RMSも参照と一致し、通常の推論への読み込みも通過した。
+実装commitは `58998e3`、検証記録は `logs/hidden-mse-validation-20261110-01/`。
+実8Bのcheckpointファイルhashも検証し、条件と結果を `validation.json` に集計した。
+
 ## 保存
 
 既存と同じ `--run-name` のパス、排他ロック、起動ごとのsession、追記ログを使う。
