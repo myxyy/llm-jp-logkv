@@ -93,6 +93,33 @@ MSEはFP32で計算し、KL/CEと同じ非padding next-token位置を使う。
 
 ## データ
 
+### マルチターン・系列長4,096向け（2026-11-15）
+
+`--conversation-mode full` は全ての完結した会話ターンを保持する。
+チャットサーバが過去の思考も状態に保持するため、過去assistantのanalysisを残す
+テンプレートのコピーをキャッシュに保存する。元モデルのテンプレートは変更しない。
+標準テンプレートをそのまま全会話に適用すると、過去ターンの思考が除かれる点に注意。
+
+```bash
+./scripts/uv.sh run --locked python scripts/prepare_distillation_data.py \
+  --output /mnt/raid0/llm-jp-logkv/datasets/distill-cache-multiturn-4096-20261115-100k \
+  --conversation-mode full --max-length 4097 \
+  --splits reasoning_low reasoning_medium reasoning_high \
+  --candidates-per-subset 100000 --seed 20261102
+```
+
+同じ3サブセット・固定revision・各サブセット全split合計10万候補を使用する。
+最小64 tokens、内容hashによる重複除去・約1%検証分割・uint32を維持し、
+上限のみ4,097 tokens（入力4,096＋next-token target用1個）とする。
+上限超過を切り詰めたり、最初の1往復へ戻したりせず、会話全体を除外する。
+未完結会話・tool等の未対応形式は後半ターンに含まれる場合も除外する。
+`records.jsonl` の `turns` とmanifestの `turn_counts` に採用された会話ターン数を記録する。
+
+訓練ではこのキャッシュと `--sequence-length 4096` を新しいrunで指定する。
+旧runの `--resume latest` でデータや系列長を変更することはできない。
+FSDPのメモリ実測は [4,096検証](fsdp-4096-preflight-20261115.md)を参照。
+従来の最初の1往復を再現する場合は `--conversation-mode first`（既定）を使用する。
+
 ### 拡充版（2026-11-03）
 
 使用する3サブセットとデータrevisionは初回試行と同じ。

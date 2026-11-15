@@ -17,8 +17,11 @@ def messages(prompt):
 
 
 class Tokenizer:
+    chat_template = '{#- CoT is dropped during all previous turns, so we never render it for inference #}'
+
     def apply_chat_template(self, messages, **kwargs):
-        return json.dumps({'prompt':messages[0]['content'],'effort':kwargs['reasoning_effort']})
+        return json.dumps({'prompts':[m['content'] for m in messages if m['role']=='user'],
+                           'effort':kwargs['reasoning_effort']})
 
     def __call__(self, texts, **kwargs):
         # Encode the effort as a large token ID, so split attribution is checked
@@ -26,7 +29,7 @@ class Tokenizer:
         ids=[]
         for text in texts:
             obj=json.loads(text)
-            length=int(obj['prompt'].rsplit(':',1)[1])
+            length=sum(int(prompt.rsplit(':',1)[1]) for prompt in obj['prompts'])
             token={'low':196605,'medium':196606,'high':196607}[obj['effort']]
             ids.append([token]*length)
         return {'input_ids':ids}
@@ -110,7 +113,8 @@ def test_low_only_reproduction_and_missing_split_rejection(source, tmp_path):
 
 
 @pytest.mark.parametrize('kwargs', [{'splits':()}, {'splits':('unknown',)},
-    {'splits':('reasoning_low','reasoning_low')}, {'candidates_per_subset':0}, {'max_length':63}])
+    {'splits':('reasoning_low','reasoning_low')}, {'candidates_per_subset':0}, {'max_length':63},
+    {'conversation_mode':'unknown'}])
 def test_invalid_cache_settings_rejected_before_writing(source, tmp_path, kwargs):
     settings,_=source
     with pytest.raises(ValueError):
@@ -122,3 +126,92 @@ def test_explicit_system_effort_overrides_split_fallback():
     raw=[{'role':'system','content':[{'type':'system_content','reasoning_effort':'High'}]},*messages('prompt:64')]
     _,kwargs=data.first_exchange(raw,reasoning_effort='medium')
     assert kwargs['reasoning_effort']=='High'
+
+
+def test_full_conversation_preserves_all_answers_thinking_and_system_metadata():
+    raw=[{'role':'system','content':[{'type':'system_content','reasoning_effort':'High'},'instructions']},
+         *messages('first'), *messages('second')]
+    converted, kwargs=data.full_conversation(raw,reasoning_effort='low')
+    assert converted==[{'role':'developer','content':'instructions'},
+        {'role':'user','content':'first'}, {'role':'assistant','content':'answer','thinking':'reason'},
+        {'role':'user','content':'second'}, {'role':'assistant','content':'answer','thinking':'reason'}]
+    assert kwargs['reasoning_effort']=='High'
+    # No thinking is invented for a turn which has only a final answer.
+    raw=[*messages('first'),{'role':'user','content':['next']},
+         {'role':'assistant','content':['final only']}]
+    converted,_=data.full_conversation(raw)
+    assert converted[-1]=={'role':'assistant','content':'final only'}
+    assert data.full_conversation(messages('one'))==data.first_exchange(messages('one'))
+
+
+@pytest.mark.parametrize('tail', [
+    [{'role':'user','content':['unfinished']}],
+    [{'role':'assistant','channel':'final','content':['orphan']}],
+    [{'role':'system','content':['late system']}],
+    [{'role':'tool','content':['tool output']}],
+    [{'role':'user','content':['a']}, {'role':'user','content':['b']}],
+    [{'role':'user','content':['a']}, {'role':'assistant','channel':'analysis','content':['r']},
+     {'role':'assistant','channel':'analysis','content':['again']},
+     {'role':'assistant','channel':'final','content':['a']}],
+    [{'role':'user','content':['a']}, {'role':'assistant','channel':'final','recipient':'tool','content':['a']}],
+    [{'role':'user','content':[{'type':'image'}]}, {'role':'assistant','channel':'final','content':['a']}],
+])
+def test_full_rejects_bad_later_turn_instead_of_silently_keeping_first(tail):
+    raw=[*messages('valid first'),*tail]
+    assert data.first_exchange(raw)[0][-1]['content']=='answer'
+    with pytest.raises(ValueError):
+        data.full_conversation(raw)
+
+
+def test_retained_template_renders_past_analysis_without_changing_final_turn():
+    from jinja2 import Environment
+    original='''{%- for message in messages %}
+{%- if loop.last %}
+{{- '<|start|>assistant<|channel|>analysis<|message|>' + message.thinking + '<|end|>' }}
+{{- '<|start|>assistant<|channel|>final<|message|>' + message.content + '<|return|>' }}
+{%- else %}
+{#- CoT is dropped during all previous turns, so we never render it for inference #}
+{{- '<|start|>assistant<|channel|>final<|message|>' + message.content + '<|end|>' }}
+{%- endif %}{%- endfor %}'''
+    adapted=data.retained_analysis_template(original)
+    env=Environment()
+    turns=[{'thinking':'earlier thought','content':'earlier answer'},
+           {'thinking':'current thought','content':'current answer'}]
+    rendered=env.from_string(adapted).render(messages=turns)
+    assert rendered==('<|start|>assistant<|channel|>analysis<|message|>earlier thought<|end|>'
+        '<|start|>assistant<|channel|>final<|message|>earlier answer<|end|>'
+        '<|start|>assistant<|channel|>analysis<|message|>current thought<|end|>'
+        '<|start|>assistant<|channel|>final<|message|>current answer<|return|>')
+    assert env.from_string(original).render(messages=turns[-1:])==env.from_string(adapted).render(messages=turns[-1:])
+    with pytest.raises(ValueError,match='Unrecognized'):
+        data.retained_analysis_template('unrecognized')
+
+
+def test_full_cache_length_filter_dedup_and_turn_counts(source,tmp_path):
+    settings,root=source
+    raw_a=[*messages('first:2000'),*messages('second:2097')]
+    raw_b=[*messages('first:2000'),*messages('different second:2097')]
+    rows=[{'ID':str(i),'messages':json.dumps(raw)} for i,raw in enumerate([
+        raw_a,raw_b,raw_a,[*messages('first:2000'),*messages('too long:2098')],
+        [*messages('first:2000'),{'role':'user','content':['unfinished:10']}],messages('single:4097')])]
+    for subset in data.SUBSETS:
+        pq.write_table(pa.Table.from_pylist(rows),root/subset/'reasoning_low-00000-of-00001.parquet')
+    manifest=data.prepare_cache(settings,tmp_path/'full',conversation_mode='full',max_length=4097,
+                                splits=('reasoning_low',))
+    records=[json.loads(l) for l in (tmp_path/'full/records.jsonl').read_text().splitlines()]
+    assert len(records)==3  # second turn distinguishes a/b, exact duplicates excluded globally
+    assert [r['turns'] for r in records]==[2,2,1]
+    assert all(r['length']==4097 for r in records)
+    assert manifest['turn_counts']['all']=={'2':2,'1':1}
+    assert sum(c['too_short_or_long'] for c in manifest['counts'].values())==3
+    assert sum(c['unsupported'] for c in manifest['counts'].values())==3
+    assert manifest['past_analysis']=='retained'
+    assert 'chat_template.jinja' in manifest['files']
+    assert manifest['effective_template_sha256']==manifest['files']['chat_template.jinja']
+    # The artifact is compatible with the trainer at 4096 and is excluded at 1024.
+    for split in ('train','valid'):
+        n=len(np.load(tmp_path/f'full/{split}.npy'))
+        if n:
+            assert len(data.TokenCache(tmp_path/'full',split,4096))==n
+            with pytest.raises(ValueError,match='No complete conversations'):
+                data.TokenCache(tmp_path/'full',split,1024)

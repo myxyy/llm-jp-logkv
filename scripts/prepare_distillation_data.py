@@ -6,12 +6,15 @@ from pathlib import Path
 from llm_jp_logkv.settings import load_settings
 settings = load_settings()
 
-from llm_jp_logkv.training_data import DATASET_ID, DATASET_REVISION, SUBSETS, SPLITS, prepare_cache
+from llm_jp_logkv.training_data import DATASET_ID, DATASET_REVISION, SUBSETS, SPLITS, CONVERSATION_MODES, prepare_cache
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--download', action='store_true')
-parser.add_argument('--max-length', type=int, default=2049)
+parser.add_argument('--max-length', type=int, default=2049,
+                    help='Total cache tokens including next-token target; use 4097 for sequence-length 4096')
+parser.add_argument('--conversation-mode', choices=CONVERSATION_MODES, default='first',
+                    help='first: legacy first exchange; full: all complete turns with previous analysis retained')
 parser.add_argument('--candidates-per-subset', type=int, default=100000,
                     help='Candidates per subset across all selected splits (default: 100000)')
 parser.add_argument('--splits', nargs='+', choices=SPLITS, default=list(SPLITS),
@@ -30,6 +33,7 @@ if args.download:
         local_dir=settings.paths['DATASET_DIR']/'llm-jp-4.1-thinking-sft-data'/DATASET_REVISION,
         allow_patterns=['README.md', *[f'{subset}/{split}-*.parquet' for subset in SUBSETS for split in args.splits]])
 manifest = prepare_cache(settings, args.output, max_length=args.max_length,
-                         candidates_per_subset=args.candidates_per_subset, seed=args.seed, splits=args.splits)
+                         candidates_per_subset=args.candidates_per_subset, seed=args.seed, splits=args.splits,
+                         conversation_mode=args.conversation_mode)
 print('Cache:', args.output)
 print('Train/validation examples:', manifest['train_examples'], manifest['valid_examples'])

@@ -37,8 +37,11 @@
   and reasoning effort fixed per conversation. Normalize EOS to the original
   Harmony past-turn boundary, and retain partial output only after full input prefill.
 - Data preparation defaults to all three reasoning splits and 100,000 candidates
-  per subset across those splits. Keep first-exchange/length/dedup/split filters;
-  use a new cache directory and retain split provenance in records/manifests.
+  per subset across those splits. Legacy `--conversation-mode first` keeps the first
+  exchange; `--conversation-mode full` retains all complete turns and past analysis.
+  For 4096-token training use `--max-length 4097`. Keep length/dedup/split filters,
+  reject unsupported or incomplete full conversations without truncation, use a new
+  cache directory, and retain split/turn/template provenance in records/manifests.
 - Training uses `--run-name` to derive experiment/log/checkpoint paths and
   `--resume latest` to continue the same run. Keep per-launch records in sessions
   and append training logs; reject concurrent launches and in-place rewinds.

@@ -221,7 +221,12 @@ CausalConvを有効にした場合は、その追加重みも
 蒸留後は `infer --adapter CHECKPOINT_DIR` と `evaluate-initial --adapter CHECKPOINT_DIR`
 で評価できます。通常の `infer` は引き続き未蒸留モデルを使用します。
 
-手動で新しく開始する例（2 GPU、global batch=24、時間制限なしで1 epoch）。
+マルチターン・系列長4,096用のキャッシュは、データ作成時に
+`--conversation-mode full --max-length 4097`を指定し、全会話と過去の思考を保持します。
+訓練側にも`--sequence-length 4096`が必要です。
+[作成コマンドとフィルタ](doc/distillation-20261102.md#マルチターン系列長4096向け2026-11-15)を参照してください。
+
+以下は従来の最初の1往復キャッシュで手動開始する例（2 GPU、global batch=24、時間制限なしで1 epoch）。
 新規学習には新しいrun名を付け、再開時は同じ名前を使います。
 以下は3サブセットのlow/medium/highから各サブセット合計10万件を候補抽出した拡充版です。
 キャッシュは訓練227,698件・検証2,243件で、既定の系列長1,024では訓練161,240件・検証1,618件を使います。

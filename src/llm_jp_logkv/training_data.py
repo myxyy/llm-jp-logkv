@@ -1,5 +1,6 @@
 """Pinned SFT conversation conversion and uint32 caches on configured storage."""
 import hashlib
+from collections import Counter
 import json
 from pathlib import Path
 import random
@@ -14,6 +15,48 @@ DATASET_REVISION = 'cb4210190af6a0000fd91cb5bb8361ad6d6ade01'
 SUBSETS = ('llmjp_magpie_sft_v1.0', 'logical_math_coding_wizard8x22b',
            'llmjp_extraction_wiki_ja_v0.3')
 SPLITS = ('reasoning_low', 'reasoning_medium', 'reasoning_high')
+CONVERSATION_MODES = ('first', 'full')
+
+
+def full_conversation(messages, *, reasoning_effort='low'):
+    """Convert all complete turns; reject partial, tool, or nonalternating dialogue."""
+    result, chunk, kwargs = [], [], None
+    pending_user = False
+    for message in messages:
+        role, channel = message['role'], message.get('channel')
+        if role in ('system', 'developer'):
+            if result or pending_user:
+                raise ValueError('System/developer messages must precede the conversation')
+        elif role == 'user':
+            if pending_user:
+                raise ValueError('Multiple user messages before an answer')
+            pending_user = True
+        elif role == 'assistant' and channel in ('analysis', 'final', None):
+            if not pending_user:
+                raise ValueError('Assistant message without a pending user')
+        else:
+            raise ValueError('Unsupported message role/channel')
+        chunk.append(message)
+        if role == 'assistant' and channel in ('final', None):
+            converted, turn_kwargs = first_exchange(chunk, reasoning_effort=reasoning_effort)
+            result.extend(converted)
+            if kwargs is None:
+                kwargs = turn_kwargs
+            chunk, pending_user = [], False
+    if chunk or not result:
+        raise ValueError('Incomplete conversation')
+    return result, kwargs
+
+
+def retained_analysis_template(original):
+    """Adapt only the pinned template's past-turn branch; leave the model file intact."""
+    marker = '{#- CoT is dropped during all previous turns, so we never render it for inference #}'
+    if not isinstance(original, str) or original.count(marker) != 1:
+        raise ValueError('Unrecognized chat template; cannot retain previous analysis safely')
+    return original.replace(marker, '''{#- Retain previous analysis to match persistent chat state. #}
+            {%- if "thinking" in message %}
+                {{- "<|start|>assistant<|channel|>analysis<|message|>" + message.thinking + "<|end|>" }}
+            {%- endif %}''')
 
 
 def first_exchange(messages, *, reasoning_effort='low'):
@@ -67,7 +110,7 @@ def first_exchange(messages, *, reasoning_effort='low'):
 
 
 def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=100000, seed=20261102,
-                  splits=SPLITS):
+                  splits=SPLITS, conversation_mode='first'):
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
     from .inference import file_hash, write_json
@@ -77,6 +120,8 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=10
         raise ValueError('Choose distinct supported reasoning splits')
     if candidates_per_subset < 1 or max_length < 64:
         raise ValueError('candidates_per_subset must be positive and max_length must be >=64')
+    if conversation_mode not in CONVERSATION_MODES:
+        raise ValueError('Unknown conversation mode')
     root = settings.paths['DATASET_DIR'] / 'llm-jp-4.1-thinking-sft-data' / DATASET_REVISION
     paths = {}
     for subset in SUBSETS:
@@ -84,9 +129,15 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=10
             paths[subset,split] = sorted((root/subset).glob(f'{split}-*.parquet'))
             if not paths[subset,split]:
                 raise FileNotFoundError(f'No downloaded shards for {subset}/{split}')
+    tokenizer = AutoTokenizer.from_pretrained(settings.model_path, local_files_only=True)
+    template_kwargs = {}
+    if conversation_mode == 'full':
+        template_kwargs['chat_template'] = retained_analysis_template(tokenizer.chat_template)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    tokenizer = AutoTokenizer.from_pretrained(settings.model_path, local_files_only=True)
+    if template_kwargs:
+        (output/'chat_template.jinja').write_text(template_kwargs['chat_template'], encoding='utf-8')
+    convert = full_conversation if conversation_mode == 'full' else first_exchange
     offsets, records, train, valid = [0], [], [], []
     counts, sources, seen = {}, [], set()
     rng = random.Random(seed)
@@ -116,25 +167,26 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=10
             counts[subset] = {'source_rows':n, 'candidates':len(reservoir), 'accepted':0,
                               'unsupported':0, 'too_short_or_long':0, 'duplicate':0,'splits':by_split}
             for begin in range(0,len(reservoir),128):
-                texts, identifiers, groups, origins = [], [], [], []
+                texts, identifiers, groups, origins, turns = [], [], [], [], []
                 for split,row in reservoir[begin:begin+128]:
                     try:
-                        messages, kwargs = first_exchange(json.loads(row['messages']),
+                        messages, kwargs = convert(json.loads(row['messages']),
                                                          reasoning_effort=split.removeprefix('reasoning_'))
                         # Group split by conversation content, independent of date/ID.
                         group = hashlib.sha256(json.dumps(messages,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
                         text = tokenizer.apply_chat_template(messages, tokenize=False,
-                                                             add_generation_prompt=False, **kwargs)
+                                                             add_generation_prompt=False, **template_kwargs, **kwargs)
                     except (ValueError,KeyError,TypeError):
                         counts[subset]['unsupported'] += 1
                         by_split[split]['unsupported'] += 1
                         continue
                     texts.append(text); identifiers.append(row['ID']); groups.append(group)
                     origins.append(split)
+                    turns.append(sum(m['role']=='user' for m in messages))
                 if not texts:
                     continue
                 encoded = tokenizer(texts, add_special_tokens=False, return_attention_mask=False)['input_ids']
-                for ids, identifier, group, split in zip(encoded, identifiers, groups, origins):
+                for ids, identifier, group, split, turn_count in zip(encoded, identifiers, groups, origins, turns):
                     if not 64 <= len(ids) <= max_length:
                         counts[subset]['too_short_or_long'] += 1
                         by_split[split]['too_short_or_long'] += 1
@@ -149,7 +201,8 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=10
                     tokens = np.asarray(ids, dtype=np.uint32)
                     tokens_file.write(tokens.tobytes())
                     offsets.append(offsets[-1]+len(ids))
-                    records.append({'subset':subset,'split':split,'id':identifier,'group_hash':group,'length':len(ids)})
+                    records.append({'subset':subset,'split':split,'id':identifier,'group_hash':group,
+                                    'length':len(ids),'turns':turn_count})
                     counts[subset]['accepted'] += 1
                     by_split[split]['accepted'] += 1
             print(subset,counts[subset],flush=True)
@@ -159,6 +212,9 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=10
     with (output/'records.jsonl').open('x',encoding='utf-8') as stream:
         for row in records:
             stream.write(json.dumps(row,ensure_ascii=False)+'\n')
+    generated_files = ['tokens.bin','offsets.npy','train.npy','valid.npy','records.jsonl']
+    if template_kwargs:
+        generated_files.append('chat_template.jinja')
     manifest = {'dataset_id':DATASET_ID,'revision':DATASET_REVISION,'splits':list(splits),
                 'subsets':list(SUBSETS),'sources':sources,'counts':counts,'seed':seed,
                 'candidates_per_subset':candidates_per_subset,
@@ -168,11 +224,18 @@ def prepare_cache(settings, output, *, max_length=2049, candidates_per_subset=10
                 'source_files_sha256':{str(p):file_hash(p) for p in
                     (Path(__file__), Path('scripts/prepare_distillation_data.py'))},
                 'train_examples':len(train),'valid_examples':len(valid),'tokens':offsets[-1],
-                'max_length':max_length,'format':'uint32, variable length, first completed exchange, no truncation',
+                'max_length':max_length,'conversation_mode':conversation_mode,
+                'past_analysis':'retained' if conversation_mode=='full' else 'not applicable (first exchange)',
+                'turn_counts':{name:dict(Counter(str(records[i]['turns']) for i in indices))
+                               for name,indices in (('all',range(len(records))),('train',train),('valid',valid))},
+                'format':('uint32, variable length, complete conversation with all analysis, no truncation'
+                          if conversation_mode=='full' else 'uint32, variable length, first completed exchange, no truncation'),
                 'tokenizer_revision':settings.model_revision,
                 'tokenizer_sha256':file_hash(settings.model_path/'tokenizer.json'),
                 'template_sha256':file_hash(settings.model_path/'chat_template.jinja'),
-                'files':{name:file_hash(output/name) for name in ('tokens.bin','offsets.npy','train.npy','valid.npy','records.jsonl')}}
+                'effective_template_sha256':file_hash(output/'chat_template.jinja' if template_kwargs
+                                                      else settings.model_path/'chat_template.jinja'),
+                'files':{name:file_hash(output/name) for name in generated_files}}
     write_json(output/'manifest.json',manifest)
     return manifest
 
