@@ -93,6 +93,8 @@ MSEはFP32で計算し、KL/CEと同じ非padding next-token位置を使う。
 
 ## データ
 
+<a id="multiturn-4096"></a>
+
 ### マルチターン・系列長4,096向け（2026-11-15）
 
 `--conversation-mode full` は全ての完結した会話ターンを保持する。
@@ -119,6 +121,58 @@ MSEはFP32で計算し、KL/CEと同じ非padding next-token位置を使う。
 旧runの `--resume latest` でデータや系列長を変更することはできない。
 FSDPのメモリ実測は [4,096検証](fsdp-4096-preflight-20261115.md)を参照。
 従来の最初の1往復を再現する場合は `--conversation-mode first`（既定）を使用する。
+
+上記キャッシュを構築済み。実装commitは`4a5d708`、構築時working tree clean。
+合計**222,322件・325,843,347 tokens**を採用し、全件が系列長4,096で使用可能。
+元の1往復キャッシュ、4,096のVRAM確認用45件キャッシュ、本番runは変更していない。
+
+| 分割 | 1往復 | 2往復 | 合計 |
+|---|---:|---:|---:|
+| 訓練 | 130,779 | 89,308 | 220,087 |
+| 検証 | 1,307 | 928 | 2,235 |
+| 合計 | 132,086 | 90,236 | 222,322 |
+
+訓練例の**40.58%が2往復**。元データに3往復以上はなく、会話を人工的に連結していない。
+
+| サブセット（各10万候補） | 1往復採用 | 2往復採用 | 長さによる除外 | 重複除外 |
+|---|---:|---:|---:|---:|
+| `llmjp_magpie_sft_v1.0` | 27,050 | 57,614 | 15,336 | 0 |
+| `logical_math_coding_wizard8x22b` | 11,414 | 32,622 | 55,964 | 0 |
+| `llmjp_extraction_wiki_ja_v0.3` | 93,622 | 0 | 665 | 5,713 |
+
+今回の候補に未対応形式による除外はなかった。採用数には訓練・検証の両方を含む。
+
+| 元split | 候補 | 採用 | 長さによる除外 | 重複除外 |
+|---|---:|---:|---:|---:|
+| reasoning_low | 90,214 | 79,285 | 7,629 | 3,300 |
+| reasoning_medium | 102,191 | 83,073 | 17,587 | 1,531 |
+| reasoning_high | 107,595 | 59,964 | 46,749 | 882 |
+
+全splitを候補に含めるが、長いhighは除外が多い。全量採用やsplit比率の均等化はしていない。
+本文・思考全体のhashで重複と検証分割を判定するため、旧キャッシュと採用数・分割所属が
+変わる例がある。過去の実験との厳密な品質比較には、別途固定した評価集合を使う。
+
+専用教師＋FSDPで手動開始する例（今回は未実行）:
+
+```bash
+./scripts/uv.sh run --locked python scripts/run_distillation_fsdp.py \
+  --run-name distill-full-fsdp-multiturn-20261115 \
+  --teacher-gpu 0 --gpus 1,2,3,4,5 \
+  --data /mnt/raid0/llm-jp-logkv/datasets/distill-cache-multiturn-4096-20261115-100k \
+  --sequence-length 4096 --batch-size 1 --grad-accum 4 \
+  --no-rope --conv-kernel-size 4 --hidden-mse-weight 0.1 --skip-samples
+```
+
+この条件は1 epoch・時間制限なしで11,005 optimizer steps。
+DistributedSamplerのdrop_lastにより末尾2例はそのepochで使わず、最後の更新は各生徒1 microbatch。
+本キャッシュの構築・検証はCPUのみで実施し、訓練は開始していない。
+記録はRAIDの`logs/multiturn-cache-4096-20261115-01/`。
+`validation.json`に全生成ファイル・旧キャッシュ・元23 shardsのhash一致、全件のoffset・
+長さ・token範囲・会話境界・analysis/final・分割・重複・ターン数の照合結果を保存した。
+各サブセット/split/ターン数から合計45例を元データから再変換し、token列の完全一致を確認。
+旧キャッシュと元レコード・本文hashが一致する単一ターン123,298件もtoken列が不変だった。
+採用会話の長さは109〜4,097 tokens、中央値1,109、90パーセンタイル3,177。
+CPUテストは392 passed。元モデルのtokenizer/templateのhashも不変。
 
 ### 拡充版（2026-11-03）
 
