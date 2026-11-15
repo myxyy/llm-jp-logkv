@@ -298,6 +298,9 @@ FSDP再開は同じ生徒台数・訓練設定が必要で、DDP/LoRA checkpoint
 保存した `adapter.pt` は通常のチャット・推論で使用できます。
 初回は `--max-steps 2 --skip-samples --skip-final-validation --val-examples-per-rank 1` を付けた
 別runでVRAMを確認できます。詳細は [専用教師＋FSDP2訓練](doc/distillation-fsdp-20261109.md)。
+系列長4,096・MSE係数0.1でも実8B・教師1＋生徒5の2更新と保存を通過しました。
+生徒割当ピーク21.86 GiBで余裕は小さく、本番マルチターンキャッシュは未作成です。
+[4,096の検証条件と結果](doc/fsdp-4096-preflight-20261115.md)を参照してください。
 
 各ブロックの教師・生徒出力を近づける補助損失は `--hidden-mse-weight 0.1` で追加できます。
 通常のLoRA/full蒸留と専用教師＋FSDPの双方に対応し、FFNは凍結を維持します。

@@ -177,3 +177,12 @@ PyTorchのallocated計測値であり、CUDA context・NCCLの外部確保やall
 これは訓練機構の確認であり、フルパラメータ蒸留後の品質改善を示すものではない。
 
 実装参照: [PyTorch 2.11 FSDP2](https://docs.pytorch.org/docs/2.11/distributed.fsdp.fully_shard.html)。
+
+## 系列長4,096の確認（2026-11-15）
+
+RoPEなし・conv4・MSE係数0.1・batch1・勾配蓄積4で、実際の約4,000-tokenの
+2往復会話を使い、初期検証・2更新・checkpoint保存を通過した。
+生徒割当ピークは19.85 / 21.86 GiB、教師17.46 GiB、更新時間は約92秒。
+外部から見た生徒使用量は最大23,943 MiBで、長期実行の余裕までは保証しない。
+本番データセットの再構築・訓練は未実施。
+[専用キャッシュ・コマンド・記録](fsdp-4096-preflight-20261115.md)を参照。
