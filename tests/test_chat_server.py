@@ -252,15 +252,15 @@ def test_sessions_isolated_expire_when_idle_and_cannot_replay_turns():
     now[0] += chat.args.session_ttl + 1
     app.expire()
     assert one in app.sessions and two not in app.sessions  # Active protected.
-    app.release()
+    app.release(one, 'r1')
     with pytest.raises(SessionError, match='advanced'):
         app.claim(one, 0, 'replayed')
     app.claim(one, 1, 'r2')
     app.discard(one)
     assert cancel is not None and one not in app.sessions
-    assert app.active[2].is_set()
+    assert app.active[0][2].is_set()
     app.commit(one, first, 'low')  # Reset during generation must not resurrect it.
-    app.release()
+    app.release(one, 'r2')
     assert one not in app.sessions
     three = app.create()
     now[0] += chat.args.session_ttl
@@ -333,7 +333,7 @@ def test_http_stream_errors_and_lock_release(http_server):
     status, data = post(port, '/api/chat', request())
     events = [json.loads(line) for line in data.splitlines()]
     assert status == 200 and events[0]['type'] == 'start' and events[-1]['complete']
-    assert app.active is None
+    assert not app.active
     assert post(port, '/api/chat', request(top_p=0))[0] == 400
     assert post(port, '/api/chat', request(), Origin='http://elsewhere')[0] == 400
     assert post(port, '/api/stop', {})[0] == 400
@@ -343,7 +343,7 @@ def test_http_stream_errors_and_lock_release(http_server):
     app.engine.model.config = original.config
     status, data = post(port, '/api/chat', request(turn=1))
     assert status == 200 and json.loads(data.splitlines()[-1])['type'] == 'error'
-    assert app.active is None
+    assert not app.active
     app.engine.model = original
     assert post(port, '/api/chat', request(turn=1))[0] == 200
 
@@ -397,7 +397,7 @@ def test_http_stop_and_busy_while_stream_is_open(http_server):
     assert json.loads(post(port, '/api/stop', {'session_id': 'test-session', 'request_id': 'request-1'})[1]) == {'stopped': True}
     assert json.loads(response.read())['stop_reason'] == 'cancelled'
     connection.close()
-    assert app.active is None
+    assert not app.active
 
 
 def test_disconnect_cancels_generator_and_releases_model(http_server):
@@ -428,7 +428,138 @@ def test_disconnect_cancels_generator_and_releases_model(http_server):
     assert closed.wait(5)
     # Generator cleanup precedes release of the lease in the handler's finally.
     deadline = time.monotonic() + 5
-    while app.active is not None and time.monotonic() < deadline:
+    while app.active and time.monotonic() < deadline:
         time.sleep(.01)
-    assert app.active is None
+    assert not app.active
     assert app.sessions['test-session'].state is previous.result_state
+
+
+@pytest.mark.parametrize('value,expected', [('0,1,2',['cuda:0','cuda:1','cuda:2']),
+    ('cuda:2, 0',['cuda:2','cuda:0']),('cpu',['cpu']),('cuda',['cuda:0']),('01',['cuda:1'])])
+def test_device_lists(value, expected):
+    args = parse_args(['--device', value])
+    assert args.devices == expected
+    assert args.device == ','.join(expected)
+
+
+@pytest.mark.parametrize('value', ['', '0,', ',0', '0,,1', '0,cuda:0', 'cuda,0',
+                                   'cpu,0', 'cpu,cpu', '-1', 'cuda:-1', 'cuda:foo'])
+def test_invalid_device_lists(value):
+    with pytest.raises(SystemExit):
+        parse_args(['--device', value])
+
+
+def test_multi_device_affinity_stop_expiry_and_release_are_isolated():
+    engines = [engine(), engine()]
+    now = [100.]
+    app = ChatApplication(engines, engines[0].args, '/checkpoint', clock=lambda: now[0])
+    one, two, three = app.create(), app.create(), app.create()
+    a, cancel_a = app.claim(one, 0, 'same-request-id')
+    b, cancel_b = app.claim(two, 0, 'same-request-id')
+    assert (a.worker, b.worker) == (0, 1)
+    with pytest.raises(SessionError) as error:
+        app.claim(three, 0, 'third')
+    assert error.value.code == 'busy' and app.sessions[three].worker is None
+    turn, _ = run_turn(engines[0])
+    app.commit(one, turn, 'low')
+    assert app.stop('same-request-id', one) and cancel_a.is_set() and not cancel_b.is_set()
+    now[0] += engines[0].args.session_ttl + 1
+    app.expire()
+    assert set(app.sessions) == {one, two}
+    app.release(one, 'wrong-id')
+    assert len(app.active) == 2
+    app.release(one, 'same-request-id')
+    assert list(app.active) == [1] and a.worker == 0
+    a_again, _ = app.claim(one, 1, 'next')
+    assert a_again is a and a_again.state is turn.result_state and a_again.worker == 0
+    app.discard(two)
+    assert cancel_b.is_set()
+    app.commit(two, turn, 'low')
+    app.release(two, 'same-request-id')
+    assert two not in app.sessions and list(app.active) == [0]
+    # An idle device cannot serve a session whose resident state is on busy GPU 0.
+    waiting = app.create()
+    app.sessions[waiting].worker = 0
+    app.sessions[waiting].state = turn.result_state
+    with pytest.raises(SessionError) as error:
+        app.claim(waiting, 0, 'waiting')
+    assert error.value.code == 'busy'
+    fresh = app.create()
+    fresh_session, _ = app.claim(fresh, 0, 'fresh')
+    assert fresh_session.worker == 1
+    app.stop()
+    assert all(active[2].is_set() for active in app.active.values())
+    app.release(fresh, 'fresh')
+    assert fresh_session.worker is None  # No committed state: reassignment is safe.
+
+
+@pytest.mark.parametrize('first_result', ['cancelled', 'error'])
+def test_http_two_replicas_generate_concurrently_and_keep_session_state(first_result):
+    entered = [threading.Event(), threading.Event()]
+    gates = [threading.Event(), threading.Event()]
+    class BlockingModel(ScriptedModel):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def __call__(self, *args, **kwargs):
+            if not self.calls:
+                entered[self.index].set()
+                assert gates[self.index].wait(10)
+                if self.index == 0 and first_result == 'error':
+                    raise RuntimeError('Replica zero failed')
+            return super().__call__(*args, **kwargs)
+
+    engines = [engine(BlockingModel(i)) for i in range(2)]
+    app = ChatApplication(engines, engines[0].args, '/checkpoint')
+    server = make_server(app, '127.0.0.1', 0)
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    connections = []
+    try:
+        keys = [app.create(), app.create()]
+        responses = []
+        for key in keys:
+            conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=10)
+            connections.append(conn)
+            conn.request('POST', '/api/chat', json.dumps(request(session_id=key)),
+                         {'Content-Type':'application/json'})
+            response = conn.getresponse()
+            assert response.status == 200
+            assert json.loads(response.readline())['type'] == 'start'
+            responses.append(response)
+        # Both entered model execution before either was allowed to complete.
+        assert all(event.wait(5) for event in entered)
+        assert len(app.active) == 2
+        assert post(server.server_port, '/api/chat', request(session_id=app.create()))[0] == 409
+        assert post(server.server_port, '/api/chat', request(session_id=keys[0],request_id='duplicate'))[0] == 409
+        if first_result == 'cancelled':
+            assert app.stop('request-1', keys[0])
+        assert not app.active[1][2].is_set()
+        gates[0].set()
+        done = json.loads(responses[0].read().splitlines()[-1])
+        if first_result == 'cancelled':
+            assert done['stop_reason'] == 'cancelled' and not done['retained']
+        else:
+            assert done['type'] == 'error' and done['error'] == 'Replica zero failed'
+        assert list(app.active) == [1]
+        gates[1].set()
+        done = json.loads(responses[1].read().splitlines()[-1])
+        assert done['complete'] and done['final'] == '42'
+        state = app.sessions[keys[1]].state
+        assert app.sessions[keys[1]].worker == 1
+        assert app.sessions[keys[0]].state is None
+        status, body = post(server.server_port, '/api/chat',request(session_id=keys[1],turn=1,prompt='次'))
+        events = [json.loads(line) for line in body.splitlines()]
+        assert status == 200 and events[0]['cached_tokens'] == state.offset
+        assert app.sessions[keys[1]].state.tokens[:state.offset] == state.tokens
+        assert app.sessions[keys[1]].worker == 1 and not app.active
+    finally:
+        for gate in gates:
+            gate.set()
+        app.stop()
+        for conn in connections:
+            conn.close()
+        server.shutdown()
+        server.server_close()
+        worker.join()

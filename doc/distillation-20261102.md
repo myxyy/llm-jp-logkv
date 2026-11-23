@@ -573,6 +573,18 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked python scripts/chat_server.p
 Reasoning effortは会話開始時に固定し、変更するときは新しい会話を開始する。
 起動オプション・履歴・SSH転送の詳細は[READMEのチャットサーバ](../README.md#チェックポイントを使うチャットサーバ)を参照。
 
+複数GPUで別の会話を並列に処理する場合は、例えば次のように指定する。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 ./scripts/uv.sh run --locked python scripts/chat_server.py \
+  --run-name distill-20261102 --checkpoint latest --device 0,1,2 --port 8000
+```
+
+各GPUへモデル全体をロードし、最初のリクエストを空きGPUへ割り当てる。
+会話状態は担当GPUに固定する。担当GPUが使用中の場合や全GPU使用中の場合はbusyを返す。
+停止・切断・期限切れ・状態の確定は会話単位で扱い、別GPUのリクエストには影響しない。
+GPU番号は`CUDA_VISIBLE_DEVICES`適用後の論理番号。
+
 ## 検証記録
 
 以下は初回の蒸留実装・8時間試行前の検証履歴。

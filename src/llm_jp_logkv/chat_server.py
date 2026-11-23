@@ -1,10 +1,11 @@
-"""Local, single-model chat server. No HF imports until settings are loaded.
+"""Local chat server with one model replica per device. Settings precede HF imports.
 
 POST /api/chat streams newline-delimited JSON. Each browser session retains its
 LogKV state, including analysis, until reset or idle expiry. Only new input is
-prefilled. Inference is serialized across sessions.
+prefilled. Sessions stay on their assigned device; devices serve concurrently.
 """
 import argparse
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,26 @@ def positive_int(value):
     return value
 
 
+def parse_devices(value):
+    devices = []
+    for part in value.split(','):
+        part = part.strip()
+        if part.isdecimal():
+            part = f'cuda:{int(part)}'
+        elif part == 'cuda':
+            part = 'cuda:0'
+        elif part.startswith('cuda:') and part[5:].isdecimal():
+            part = f'cuda:{int(part[5:])}'
+        elif part != 'cpu':
+            raise ValueError('device must be cpu, cuda:N, or comma-separated GPU indices (e.g. 0,1,2)')
+        if part in devices:
+            raise ValueError('device indices must be distinct')
+        devices.append(part)
+    if len(devices) > 1 and 'cpu' in devices:
+        raise ValueError('cpu cannot be combined with GPU devices')
+    return devices
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-name', help='Select a run under CHECKPOINT_DIR')
@@ -33,7 +54,8 @@ def parse_args(argv=None):
                         help='latest (requires --run-name), step name, or checkpoint directory')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8000)
-    parser.add_argument('--device', default='cuda:0', help='cuda:0, cuda:1, cpu, or GPU index')
+    parser.add_argument('--device', default='cuda:0',
+                        help='cpu, cuda:0, or GPU list such as 0,1,2 (one model per GPU)')
     parser.add_argument('--max-new-tokens', type=positive_int, default=2048,
                         help='Default and maximum output length per turn, including analysis')
     parser.add_argument('--session-ttl', type=positive_int, default=1800,
@@ -47,8 +69,11 @@ def parse_args(argv=None):
         parser.error('--port must be between 0 and 65535')
     if not 0 <= args.temperature <= 2 or not 0 < args.top_p <= 1:
         parser.error('temperature must be in [0, 2] and top-p in (0, 1]')
-    if args.device.isdecimal():
-        args.device = 'cuda:' + args.device
+    try:
+        args.devices = parse_devices(args.device)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.device = ','.join(args.devices)
     return args
 
 
@@ -114,6 +139,7 @@ class ChatSession:
     effort: str | None = None
     turn: int = 0
     last_used: float = 0.
+    worker: int | None = None
 
 
 @dataclass
@@ -228,7 +254,8 @@ class ChatEngine:
     def stream(self, turn, options, cancel):
         import torch
         # inference_mode must be entered in the HTTP worker thread.
-        with torch.inference_mode():
+        device = torch.cuda.device(self.args.device) if self.args.device.startswith('cuda:') else nullcontext()
+        with device, torch.inference_mode():
             ids, state = turn.ids, turn.initial_state
             cached = state.offset if state is not None else 0
             reason, count, prefilled = 'length', 0, 0
@@ -284,18 +311,21 @@ class ChatEngine:
 
 class ChatApplication:
     def __init__(self, engine, args, checkpoint, *, clock=time.monotonic):
-        self.engine, self.args = engine, args
+        self.engines = list(engine) if isinstance(engine, (list, tuple)) else [engine]
+        if not self.engines:
+            raise ValueError('At least one chat engine is required')
+        self.engine, self.args = self.engines[0], args
         self.checkpoint = str(checkpoint)
         self.lock = threading.Lock()
-        self.active = None
+        self.active = {}
         self.sessions = {}
         self.clock = clock
 
     def _expire(self):
         now = self.clock()
-        active_id = self.active[0] if self.active else None
+        active_ids = {active[0] for active in self.active.values()}
         for key, session in list(self.sessions.items()):
-            if key != active_id and now - session.last_used >= self.args.session_ttl:
+            if key not in active_ids and now - session.last_used >= self.args.session_ttl:
                 del self.sessions[key]
 
     def expire(self):
@@ -311,8 +341,9 @@ class ChatApplication:
 
     def discard(self, key):
         with self.lock:
-            if self.active and self.active[0] == key:
-                self.active[2].set()
+            for active in self.active.values():
+                if active[0] == key:
+                    active[2].set()
             self.sessions.pop(key, None)
 
     def claim(self, key, expected_turn, request_id):
@@ -321,12 +352,21 @@ class ChatApplication:
             session = self.sessions.get(key)
             if session is None:
                 raise SessionError(410, 'session_expired', 'Session expired or server restarted. Start a new conversation.')
-            if self.active is not None:
+            if any(active[0] == key for active in self.active.values()):
                 raise SessionError(409, 'busy', 'Another response is being generated. Retry after it finishes.')
             if session.turn != expected_turn:
                 raise SessionError(409, 'stale_turn', 'Session has advanced. Start a new conversation to avoid replaying a turn.')
+            if session.worker is None:
+                available = [i for i in range(len(self.engines)) if i not in self.active]
+                if not available:
+                    raise SessionError(409, 'busy', 'All devices are busy. Retry after a response finishes.')
+                # Prefer the idle device retaining the fewest sessions; stable ties
+                # follow CLI order. State is never moved between devices.
+                session.worker = min(available, key=lambda i: sum(s.worker == i for s in self.sessions.values()))
+            elif session.worker in self.active:
+                raise SessionError(409, 'busy', 'This session\'s device is busy. Retry after it finishes.')
             cancel = threading.Event()
-            self.active = (key, request_id, cancel)
+            self.active[session.worker] = (key, request_id, cancel)
             return session, cancel
 
     def commit(self, key, turn, effort):
@@ -338,17 +378,24 @@ class ChatApplication:
 
     def stop(self, request_id=None, key=None):
         with self.lock:
-            if self.active and (request_id is None or
-                    (request_id == self.active[1] and key == self.active[0])):
-                self.active[2].set()
-                return True
-            return False
+            stopped = False
+            for active in self.active.values():
+                if request_id is None or (request_id == active[1] and key == active[0]):
+                    active[2].set()
+                    stopped = True
+            return stopped
 
-    def release(self):
+    def release(self, key, request_id):
         with self.lock:
-            if self.active and self.active[0] in self.sessions:
-                self.sessions[self.active[0]].last_used = self.clock()
-            self.active = None
+            for worker, active in list(self.active.items()):
+                if (key, request_id) != active[:2]:
+                    continue
+                if key in self.sessions:
+                    session = self.sessions[key]
+                    session.last_used = self.clock()
+                    if session.state is None:
+                        session.worker = None  # Failed/cancelled initial prefill.
+                del self.active[worker]
 
 
 def make_server(app, host, port):
@@ -371,7 +418,8 @@ def make_server(app, host, port):
             if self.path == '/':
                 self.respond(200, Path(__file__).with_name('chat.html').read_bytes(), 'text/html; charset=utf-8')
             elif self.path == '/api/config':
-                self.respond(200, {'checkpoint': app.checkpoint, **{
+                self.respond(200, {'checkpoint': app.checkpoint,
+                    'devices': [engine.args.device for engine in app.engines], **{
                     key: getattr(app.args, key) for key in
                     ('max_new_tokens', 'session_ttl', 'temperature', 'top_p', 'reasoning_effort')}})
             else:
@@ -421,7 +469,8 @@ def make_server(app, host, port):
             stream = None
             streaming = False
             try:
-                turn = app.engine.prepare(prompt, options, session)
+                engine = app.engines[session.worker]
+                turn = engine.prepare(prompt, options, session)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
                 self.send_header('Cache-Control', 'no-store')
@@ -429,8 +478,10 @@ def make_server(app, host, port):
                 self.send_header('Connection', 'close')
                 self.end_headers()
                 streaming = True
-                stream = app.engine.stream(turn, options, cancel)
+                stream = engine.stream(turn, options, cancel)
                 for event in stream:
+                    if event['type'] == 'start':
+                        event['device'] = engine.args.device
                     if event['type'] == 'done':
                         event['turn'] = session.turn + int(turn.retained)
                     self.send_event(event)
@@ -448,9 +499,11 @@ def make_server(app, host, port):
                     self.respond(400 if isinstance(exc, ValueError) else 500, {'error': str(exc)})
             finally:
                 cancel.set()
-                if stream is not None:
-                    stream.close()
-                app.release()
+                try:
+                    if stream is not None:
+                        stream.close()
+                finally:
+                    app.release(key, request_id)
 
         def send_event(self, event):
             self.wfile.write((json.dumps(event, ensure_ascii=False) + '\n').encode())
@@ -476,11 +529,21 @@ def main(argv=None):
     import subprocess
 
     print(f'Loading checkpoint: {checkpoint}', flush=True)
-    tokenizer, source = load_model(settings, args.device)
-    model = student_from_checkpoint(source, checkpoint, model_id=settings.model_id,
-                                    model_revision=settings.model_revision, chunk_size=config['chunk_size'])
-    del source
-    app = ChatApplication(ChatEngine(model, tokenizer, args), args, checkpoint)
+    import torch
+    for device in args.devices:
+        if device.startswith('cuda:') and int(device[5:]) >= torch.cuda.device_count():
+            raise ValueError(f'Unavailable device: {device}; indices refer to CUDA_VISIBLE_DEVICES')
+    engines = []
+    for device in args.devices:
+        print(f'Loading replica on {device}', flush=True)
+        with torch.cuda.device(device) if device.startswith('cuda:') else nullcontext():
+            tokenizer, source = load_model(settings, device)
+            model = student_from_checkpoint(source, checkpoint, model_id=settings.model_id,
+                                            model_revision=settings.model_revision, chunk_size=config['chunk_size'])
+            del source
+        worker_args = argparse.Namespace(**{**vars(args), 'device': device})
+        engines.append(ChatEngine(model, tokenizer, worker_args))
+    app = ChatApplication(engines, args, checkpoint)
     server = make_server(app, args.host, args.port)
     record = settings.paths['LOG_DIR'] / f'chat-{new_session_id()}.json'
     record.parent.mkdir(parents=True, exist_ok=True)

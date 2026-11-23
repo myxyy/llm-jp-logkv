@@ -141,6 +141,10 @@ CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked python scripts/chat_server.p
 CUDA_VISIBLE_DEVICES=0 ./scripts/uv.sh run --locked python scripts/chat_server.py \
   --checkpoint /mnt/raid0/llm-jp-logkv/checkpoints/distill-20261102/step-0002599 \
   --port 8000
+
+# 3 GPUへモデルを1個ずつ配置し、別の会話を並列処理する
+CUDA_VISIBLE_DEVICES=0,1,2 ./scripts/uv.sh run --locked python scripts/chat_server.py \
+  --run-name distill-20261102 --checkpoint latest --device 0,1,2
 ```
 
 ブラウザで `http://127.0.0.1:8000` を開く。`--run-name` 指定時の
@@ -159,7 +163,9 @@ hashを検査する。LoRA rank・alpha・LogKV chunk size・RoPE・CausalConv�
   「新しい会話」で変更する。temperature・top-p・生成上限はターンごとに変更できる。
 - ブラウザのタブごとにLogKV状態をサーバで保持し、2ターン目以降は新しい質問だけを
   追加する。会話履歴の読み直しは行わず、過去のanalysisもfinalも圧縮状態に保持する。
-  同時生成は1件で、他の要求にはbusyを返す。
+  GPUごとに同時生成は1件。複数GPU指定では別の会話をGPU台数まで並列処理する。
+  最初のリクエスト時に空いているGPUのうち保持セッション数が最も少ないGPUへ割り当て、
+  以後は同じGPUで続ける。全GPUまたは会話の担当GPUが処理中ならbusyを返す（待ち行列なし）。
 - 入力トークン数の上限はなく、`--max-input-tokens` は廃止した。
   元モデルの `max_position_embeddings` による拒否も行わない。
   入力は `--prefill-chunk-size`（既定128）ずつ処理する。
@@ -176,7 +182,10 @@ hashを検査する。LoRA rank・alpha・LogKV chunk size・RoPE・CausalConv�
 追加依存なしのローカルサーバ（認証なし）で、既定hostは `127.0.0.1`。
 SSH先で起動した場合はVS Codeのポート転送、または
 `ssh -L 8000:127.0.0.1:8000 HOST` でアクセスできる。
-`--device cuda:0`、`--host`、`--port` も指定可能。Ctrl+Cでサーバを終了する。
+`--device cuda:0`、`--device 0,1,2`、`--device cuda:0,cuda:1`、`--device cpu`に対応。
+番号は`CUDA_VISIBLE_DEVICES`適用後の論理番号。各GPUにモデル全体を置くため、各GPUに
+1モデル分のVRAMが必要。1つの応答を複数GPUへ分割する方式ではない。
+`--host`、`--port`も指定可能。Ctrl+Cで全GPUの応答を停止してサーバを終了する。
 起動条件は `${LOG_DIR}/chat-*.json` に保存し、会話本文はサーバのファイルへ保存しない。
 本体プロジェクトの作業ツリーやサーバ用Python環境には依存しない。
 
